@@ -1,0 +1,69 @@
+name: Build apps
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pytest
+      - run: python -m pytest -q tests
+
+  build:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: AbletonBridge-Windows
+          - os: macos-latest
+            artifact: AbletonBridge-Mac-AppleSilicon
+          - os: macos-15-intel
+            artifact: AbletonBridge-Mac-Intel
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller pytest
+      - run: python -m pytest -q tests
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name AbletonBridge AbletonBridge.py
+          Compress-Archive -Path dist/AbletonBridge.exe -DestinationPath ${{ matrix.artifact }}.zip
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          pyinstaller --noconfirm --windowed --name "Ableton Bridge" \
+            --osx-bundle-identifier com.abletonbridge.app AbletonBridge.py
+          /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string 'Ableton Bridge presses Save in Ableton Live before sending a project.'" "dist/Ableton Bridge.app/Contents/Info.plist"
+          codesign --force --deep --sign - "dist/Ableton Bridge.app"
+          ditto -c -k --keepParent "dist/Ableton Bridge.app" ${{ matrix.artifact }}.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact }}.zip
