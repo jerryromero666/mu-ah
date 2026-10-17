@@ -123,7 +123,7 @@ class Bridge:
                     "Save it once in Live first, or add its folder in Settings). Using the newest saved project.")
         return self.current_project()
 
-    def send(self, project_dir: Path, resolution: str | None = None, progress=None, log=None) -> PushResult:
+    def send(self, project_dir: Path, resolution=None, progress=None, log=None) -> PushResult:
         drive = self.require_drive()
         result = push(self.store, drive, project_dir, resolution=resolution, progress=progress, log=log)
         self.publish_machine(log=log)
@@ -131,12 +131,19 @@ class Bridge:
                                      search_dirs=self.store.settings.sample_search_dirs)
         return result
 
-    def get(self, drive_name: str, resolution: str | None = None, progress=None, log=None) -> PullResult:
+    def get(self, drive_name: str, resolution=None, progress=None, log=None) -> PullResult:
         drive = self.require_drive()
         dest = None
+        rows = self.rows()  # also re-links project folders that were moved on this computer
         if self.store.project_state(drive_name) is None:
             # Same project already on this computer (e.g. copied by hand before)? Update that copy.
-            dest = next((r.local_dir for r in self.rows() if r.name == drive_name and r.local_dir), None)
+            # Folders known to hold a different song aren't offered (see pull()); with several
+            # same-name folders, prefer the one whose parent folder matches the drive location.
+            cands = [r.local_dir for r in rows if r.name == drive_name and r.status == "unlinked"]
+            parts = (drive.manifest(drive_name) or {}).get("path", "").split("/")
+            parent = parts[-2] if len(parts) >= 2 else ""
+            cands.sort(key=lambda d: d.parent.name.lower() != parent.lower())
+            dest = cands[0] if cands else None
         result = pull(self.store, drive, drive_name, resolution=resolution, dest=dest, progress=progress,
                       log=log)
         me = [m for m in self.machines() if m.id == self.store.settings.machine_id]

@@ -37,16 +37,18 @@ def _ask(conflict: Conflict) -> str | None:
 
 
 def _with_conflicts(fn, resolution):
+    answers = [resolution] if resolution else []
     while True:
         try:
-            return fn(resolution)
+            return fn(tuple(answers))
         except Conflict as c:
-            if resolution:
-                raise
-            resolution = _ask(c)
-            if not resolution:
+            if any(a in c.options for a in answers):
+                raise  # already answered this exact question; don't loop
+            choice = _ask(c)
+            if not choice:
                 print("Cancelled - nothing was changed.")
                 return None
+            answers.append(choice)
 
 
 def main(argv=None) -> int:
@@ -62,7 +64,7 @@ def main(argv=None) -> int:
     p = sub.add_parser("get", help="get a project from the drive (default: latest from the other computer)")
     p.add_argument("name", nargs="?")
     p.add_argument("--open", action="store_true", help="open it in Ableton Live afterwards")
-    p.add_argument("--resolve", choices=["backup_and_get", "continue"])
+    p.add_argument("--resolve", choices=["backup_and_get", "keep_both", "continue"])
     p = sub.add_parser("check", help="health check: missing files, plugins on each computer")
     p.add_argument("project")
     p = sub.add_parser("collect", help="pack every outside file into the project (like Live's Collect All)")

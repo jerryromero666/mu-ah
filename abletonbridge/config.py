@@ -84,13 +84,24 @@ class LocalStore:
     def project_state(self, drive_name: str) -> dict | None:
         return self.state["projects"].get(drive_name)
 
-    def set_project_state(self, drive_name: str, local_path: Path, revision: int, files: dict) -> None:
+    def set_project_state(self, drive_name: str, local_path: Path, revision: int, files: dict,
+                          project_id: str | None = None) -> None:
+        # One local folder is linked to at most one drive project.
+        target = os.path.normcase(str(Path(local_path)))
+        for name in [n for n, st in self.state["projects"].items()
+                     if n != drive_name and os.path.normcase(st.get("local_path", "")) == target]:
+            del self.state["projects"][name]
         self.state["projects"][drive_name] = {
             "local_path": str(local_path),
             "revision": revision,
             "files": files,
+            "project_id": project_id,
         }
         self.save_state()
+
+    def forget_project(self, drive_name: str) -> None:
+        if self.state["projects"].pop(drive_name, None) is not None:
+            self.save_state()
 
     def drive_name_for_local(self, local_path: Path) -> str | None:
         target = os.path.normcase(str(Path(local_path)))

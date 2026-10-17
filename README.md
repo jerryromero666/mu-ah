@@ -88,6 +88,25 @@ You don't need to move anything. When you set up a drive that already has Ableto
 
 Keep each song in its own folder. Loose `.als` files at the very top of the drive are ignored.
 
+## When names are the same
+
+- **Each project carries a hidden ID.** The ID lives in `Ableton Project Info/AbletonBridge.json`
+  and travels with the project, so the app knows whether two folders are the same song, whatever
+  they're called. Ableton calls every new project "Untitled Project", so this matters.
+- **Two different songs with the same name** never replace each other. Send asks first, with
+  *Send mine as a separate copy* (it becomes e.g. `Untitled Project (Studio-Mac)`) or *Replace the
+  one on the drive*. Get puts a different song into its own folder (`Untitled Project (2)`) instead
+  of mixing it into yours. Both show in the list, labelled with their parent folder.
+- **The same song changed in two places** gets one question: keep yours and get theirs as a separate
+  copy, or get theirs (yours goes to `Backup/Before get <date>/`). Every file of yours that gets
+  replaced is backed up first, not just the Live Set.
+- **Saved straight onto the drive in Live?** Send and Get check the drive right before they run. A
+  set on the drive that would be replaced is first copied to `Backup/Before send <date>/` on the drive.
+- **Names Windows can't store** (`What If?.als`, `Mix 10:17.wav`, folders ending in a space) are
+  stored on the drive under a safe name (`What If_.als`) instead of failing. Two files whose names
+  only differ in capital letters or accents can't both exist on the drive; the app tells you which.
+- **Moving or renaming a project folder** on your computer keeps it linked.
+
 ## Day to day
 
 - On the computer you worked on: save in Live (or let the app do it) and click **↑ Send to Drive**.

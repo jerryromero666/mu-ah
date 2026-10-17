@@ -304,12 +304,25 @@ def wait_for_file_change(paths_mtimes: dict[Path, float], roots_scan, timeout: f
     return None
 
 
+def long_path(path: Path) -> Path:
+    """On Windows, the '\\\\?\\' form of an absolute path, which isn't limited to 260 characters."""
+    if not IS_WINDOWS:
+        return Path(path)
+    s = os.path.abspath(str(path))
+    if s.startswith("\\\\?\\"):
+        return Path(s)
+    if s.startswith("\\\\"):  # network share
+        return Path("\\\\?\\UNC\\" + s[2:])
+    return Path("\\\\?\\" + s)
+
+
 def copy_file(src: Path, dst: Path, progress=None, mtime: float | None = None) -> None:
     """Copy file contents atomically (temp file + rename) without macOS metadata.
 
     Plain data copy on purpose: copying extended attributes to an exFAT drive is
     what produces the "._filename" junk files.
     """
+    src, dst = long_path(src), long_path(dst)
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_name(dst.name + ".abtmp")
     with open(src, "rb") as fin, open(tmp, "wb") as fout:

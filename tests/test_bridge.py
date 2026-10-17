@@ -263,7 +263,7 @@ def test_pull_backs_up_local_changes(song, tmp_path):
         pull(pc, drive, "Song Project")
     res = pull(pc, drive, "Song Project", resolution="backup_and_get")
     assert "Song.als" in res.backups
-    assert list((local / "Backup").glob("Before getting from drive */Song.als"))
+    assert list((local / "Backup").glob("Before get */Song.als"))
 
 
 def test_name_taken_on_drive(tmp_path):
@@ -446,3 +446,213 @@ def test_uneditable_set_never_breaks_get(tmp_path, monkeypatch):
     assert res.files_received > 0 and res.main_set.is_file()
     assert any("left unchanged" in line for line in logs)
     assert not (res.local_dir / "Samples" / "Imported").exists()  # nothing copied for a set left as-is
+
+
+# ----------------------------------------------------------------------------- same names (regressions)
+
+def _bump(path, secs=60):
+    st = path.stat()
+    os.utime(path, (st.st_mtime + secs, st.st_mtime + secs))
+
+
+def _song(folder, tag, sample=b"S"):
+    write(folder / "Samples" / "Recorded" / "Audio 1.wav", sample * 10)
+    return make_set(folder / f"{folder.name.replace(' Project', '')}.als",
+                    [audio_track(tag, modern_fileref("Samples/Recorded/Audio 1.wav", "/x", 3, len(sample) * 10))])
+
+
+def _exfat(monkeypatch):
+    """Make drive writes behave like exFAT: names with  " * : < > ? \\ |  are refused."""
+    import abletonbridge.platform_utils as pu
+    real = pu.copy_file
+
+    def copy(src, dst, *a, **k):
+        if any(c in Path(dst).name for c in '"*:<>?\\|') or any(c in str(dst) for c in ':?*"<>|'
+                                                                 if "USB" in str(dst)):
+            raise OSError(22, "Invalid argument")
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(pu, "copy_file", copy)
+
+
+def test_two_different_untitled_projects_never_replace_each_other(tmp_path):
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    a = tmp_path / "Music" / "Untitled Project"
+    b = tmp_path / "Desktop" / "Untitled Project"
+    _song(a, "SONG-A")
+    _song(b, "SONG-B", b"B")
+    mac.settings.project_roots = [str(tmp_path / "Music"), str(tmp_path / "Desktop")]
+    push(mac, drive, a)
+    rows = [r for r in project_rows(mac, drive) if r.local_dir]
+    assert len(rows) == 2 and len({r.label for r in rows}) == 2       # both listed, told apart
+    with pytest.raises(Conflict) as exc:
+        push(mac, drive, b)
+    assert exc.value.kind == "name_taken"
+    r = push(mac, drive, b, resolution="keep_both")
+    assert r.drive_name == "Untitled Project (Studio-Mac)"
+    assert "SONG-A" in read_set_xml(drive.projects_dir / "Untitled Project" / "Untitled.als")
+
+
+def test_replaced_by_a_different_song_never_lands_in_my_folder(tmp_path):
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    mine = Path(mac.settings.workspace) / "Untitled Project"
+    _song(mine, "MAC-SONG")
+    push(mac, drive, mine)
+    theirs = Path(pc.settings.workspace) / "Untitled Project"
+    _song(theirs, "PC-SONG", b"P")
+    with pytest.raises(Conflict):
+        push(pc, drive, theirs)
+    push(pc, drive, theirs, resolution="overwrite")
+    assert list((drive.projects_dir / "Untitled Project" / "Backup").glob("Before send */Untitled.als"))
+    row = {(r.name, r.status) for r in project_rows(mac, drive)}
+    assert ("Untitled Project", "local_only") in row and ("Untitled Project", "drive_only") in row
+    got = pull(mac, drive, "Untitled Project")
+    assert got.local_dir != mine and "PC-SONG" in read_set_xml(got.main_set)
+    assert "MAC-SONG" in read_set_xml(mine / "Untitled.als")          # my song untouched
+
+
+def test_separate_copy_then_get_the_other_version(tmp_path, song):
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    push(mac, drive, song)
+    pc_local = pull(pc, drive, "Song Project").local_dir
+    _bump(pc_local / "Song.als", 100)
+    push(pc, drive, pc_local)
+    _bump(song / "Song.als", 200)
+    with pytest.raises(Conflict):
+        push(mac, drive, song)
+    push(mac, drive, song, resolution="keep_both")
+    got = pull(mac, drive, "Song Project")
+    assert got.local_dir != song                                       # not merged into my folder
+    assert mac.drive_name_for_local(song) == "Song Project (Studio-Mac)"
+
+
+def test_new_song_saved_where_an_old_one_was_renamed_from(tmp_path):
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    p = tmp_path / "Music" / "Untitled Project"
+    _song(p, "OLD")
+    push(mac, drive, p)
+    p.rename(tmp_path / "Music" / "Night Drive Project")
+    _song(p, "NEW", b"N")                                              # Live's default name again
+    with pytest.raises(Conflict) as exc:
+        push(mac, drive, p)
+    assert exc.value.kind == "name_taken"
+
+
+def test_moved_project_folder_stays_linked(tmp_path, song):
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    push(mac, drive, song)
+    moved = tmp_path / "Desktop" / "Song Project"
+    moved.parent.mkdir()
+    song.rename(moved)
+    mac.settings.project_roots = [str(tmp_path / "Desktop")]
+    row = {r.name: r for r in project_rows(mac, drive)}["Song Project"]
+    assert row.local_dir == moved and row.status == "synced"
+
+
+def test_saved_on_the_drive_then_send_or_get_right_away(tmp_path, song):
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    push(mac, drive, song)
+    pc_local = pull(pc, drive, "Song Project").local_dir
+    on_drive = drive.projects_dir / "Song Project" / "Song.als"
+    make_set(on_drive, [midi_track("SAVED-ON-DRIVE", "")])
+    _bump(on_drive, 600)
+    # Get right away (no list refresh in between) gets the drive version
+    got = pull(pc, drive, "Song Project")
+    assert "SAVED-ON-DRIVE" in read_set_xml(got.main_set)
+    # The Mac's older copy can't silently replace it
+    _bump(song / "Song.als", 700)
+    with pytest.raises(Conflict) as exc:
+        push(mac, drive, song)
+    assert exc.value.kind == "drive_newer"
+    push(mac, drive, song, resolution="overwrite")
+    backup = next((drive.projects_dir / "Song Project" / "Backup").glob("Before send */Song.als"))
+    assert "SAVED-ON-DRIVE" in read_set_xml(backup)
+
+
+def test_interrupted_send_answer_doesnt_skip_other_questions(tmp_path, song):
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    push(mac, drive, song)
+    local = pull(pc, drive, "Song Project").local_dir
+    write(local / "Song.wav", b"MY MIXDOWN")                           # changes on the PC
+    write(local / "Samples" / "Recorded" / "Vox.wav", b"EDITED" * 30)
+    _bump(song / "Song.als", 300)
+    push(mac, drive, song)
+    drive.lock("Song Project", "Studio-Mac")
+    with pytest.raises(Conflict) as exc:
+        pull(pc, drive, "Song Project")
+    assert exc.value.kind == "incomplete"
+    with pytest.raises(Conflict) as exc:
+        pull(pc, drive, "Song Project", resolution=("continue",))
+    assert exc.value.kind == "both_changed"
+    res = pull(pc, drive, "Song Project", resolution=("continue", "backup_and_get"))
+    assert "Samples/Recorded/Vox.wav" in res.backups
+    assert next(local.glob("Backup/Before get */Samples/Recorded/Vox.wav")).read_bytes() == b"EDITED" * 30
+
+
+def test_names_the_drive_cant_store_dont_block_send(tmp_path, monkeypatch):
+    _exfat(monkeypatch)
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    proj = tmp_path / "Music" / "What If? Project"
+    _song(proj, "WHAT-IF")                                             # -> "What If?.als"
+    write(proj / "Bounces" / "Mix 10:17.wav", b"BOUNCE")
+    write(proj / "Backup" / "What If? [2026-10-16 221503].als", b"live backup")
+    write(proj / "Samples" / "Imported" / "Kick: Hard.wav", b"K" * 9)   # from Live's own Collect All
+    make_set(proj / "What If?.als", [
+        audio_track("Vox", modern_fileref("Samples/Recorded/Audio 1.wav", "/x", 3, 10)),
+        audio_track("Kick", modern_fileref("Samples/Imported/Kick: Hard.wav", "/x", 3, 9))])
+    res = push(mac, drive, proj)
+    assert res.drive_name == "What If_ Project" and res.main_set == "What If_.als"
+    files = drive.manifest("What If_ Project")["files"]
+    assert "Bounces/Mix 10_17.wav" in files and "Samples/Imported/Kick_ Hard.wav" in files
+    assert not any(":" in f or "?" in f for f in files)
+    assert sum(1 for f in files if f.startswith("Samples/Imported/Kick")) == 1   # no duplicate copy
+    got = pull(pc, drive, "What If_ Project")
+    assert got.main_set.name == "What If_.als" and collect_project(got.local_dir).missing == []
+    again = push(mac, drive, proj)                                     # stable: nothing new to send
+    assert again.files_sent == 0
+
+
+def test_case_twins_are_explained(tmp_path):
+    from abletonbridge.sync import BridgeError
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    proj = tmp_path / "Music" / "Twin Project"
+    _song(proj, "T")
+    write(proj / "Samples" / "Recorded" / "audio 1.wav", b"other")
+    if (proj / "Samples" / "Recorded" / "Audio 1.wav").read_bytes() == b"other":
+        pytest.skip("case-insensitive filesystem")
+    with pytest.raises(BridgeError, match="capital letters"):
+        push(mac, drive, proj)
+
+
+def test_projects_synced_by_the_older_version_keep_working(tmp_path, song):
+    import json
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    push(mac, drive, song)
+    local = pull(pc, drive, "Song Project").local_dir
+    # simulate the previous app version: no ids anywhere
+    from abletonbridge.sync import ID_FILE
+    for folder in (song, local, drive.projects_dir / "Song Project"):
+        folder.joinpath(*ID_FILE).unlink()
+    m = drive.manifest("Song Project")
+    m.pop("id")
+    m["files"].pop("/".join(ID_FILE))
+    drive.write_manifest("Song Project", m)
+    for store in (mac, pc):
+        for st in store.state["projects"].values():
+            st["project_id"] = None
+            st["files"].pop("/".join(ID_FILE), None)
+        store.save_state()
+    pull(mac, drive, "Song Project")                                   # Mac gets: drive assigns an id
+    _bump(local / "Song.als", 50)
+    r = push(pc, drive, local)                                         # PC: no "different project" question
+    assert r.revision == 2
+    assert json.loads(local.joinpath(*ID_FILE).read_text())["id"] == drive.manifest("Song Project")["id"]

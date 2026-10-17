@@ -27,17 +27,20 @@ from __future__ import annotations
 import json
 import os
 import time
+import unicodedata
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import platform_utils as pu
 from .alsfile import find_sets
-from .collect import CollectResult, collect_project, safe_filename
+from .collect import CollectResult, collect_project, file_sha1, name_is_portable, safe_filename
 from .config import LocalStore, _atomic_write_json, read_json
 
 MTIME_TOLERANCE = 2.1  # FAT/exFAT timestamps are coarse
 EXCLUDED_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini", ".Spotlight-V100", ".Trashes", ".fseventsd",
-                  ".TemporaryItems", "$RECYCLE.BIN", "System Volume Information"}
+                  ".TemporaryItems", "$RECYCLE.BIN", "System Volume Information", "Icon\r"}
+ID_FILE = ("Ableton Project Info", "AbletonBridge.json")
 
 
 class BridgeError(Exception):
@@ -59,10 +62,98 @@ def is_excluded(name: str) -> bool:
     return name in EXCLUDED_NAMES or name.startswith("._") or name.endswith((".abtmp", ".tmp"))
 
 
+def _resolutions(resolution) -> set[str]:
+    """Answers the user already gave to this action's questions (one string or several)."""
+    if not resolution:
+        return set()
+    if isinstance(resolution, str):
+        return {resolution}
+    return set(resolution)
+
+
+# ---- project identity -------------------------------------------------------------
+# A small file inside the project ("Ableton Project Info/AbletonBridge.json") holds a random id.
+# It travels with the project, so the app can tell "the same song" from "a different song that
+# happens to have the same folder name" (Ableton names every new project "Untitled Project").
+
+def read_project_id(folder: Path) -> str | None:
+    data = read_json(Path(folder).joinpath(*ID_FILE))
+    pid = (data or {}).get("id")
+    return pid if isinstance(pid, str) and pid else None
+
+
+def write_project_id(folder: Path, pid: str) -> None:
+    _atomic_write_json(Path(folder).joinpath(*ID_FILE), {"id": pid, "note": "Used by Ableton Bridge to recognise "
+                                                                            "this project. Safe to ignore."})
+
+
+def ensure_project_id(folder: Path) -> str:
+    pid = read_project_id(folder)
+    if not pid:
+        pid = uuid.uuid4().hex
+        write_project_id(folder, pid)
+    return pid
+
+
+def _name_key(rel: str) -> str:
+    """Names that the drive / Windows / macOS treat as the same file."""
+    return unicodedata.normalize("NFC", rel).casefold()
+
+
+def drive_names(project_dir: Path, snap: dict[str, list], log=None) -> dict[str, str]:
+    """Map each local file (project-relative) to the name it gets on the drive.
+
+    Names the drive or Windows can't store ("What If?.als", "Mix 10:17.wav", a folder ending
+    in a space...) get a safe name instead of making the whole Send fail. A file whose only
+    problem is its name and that already exists in the project under a safe name (Ableton
+    Bridge made that copy for the sets) is left on this computer.
+    """
+    log = log or (lambda m: None)
+    mapping: dict[str, str] = {}
+    taken: dict[str, str] = {}
+    for rel in sorted(r for r in snap if name_is_portable(r)):
+        key = _name_key(rel)
+        if key in taken:
+            raise BridgeError(
+                f"Two files in this project have names that only differ in capital letters or accents: "
+                f"\"{taken[key]}\" and \"{rel}\". The drive and the other computer would treat them as one "
+                "file - rename or delete one, then send again.")
+        taken[key] = rel
+        mapping[rel] = rel
+    for rel in sorted(r for r in snap if not name_is_portable(r)):
+        parts = rel.split("/")
+        safe = [safe_filename(p, max_len=255) for p in parts]
+        cand = "/".join(safe)
+        twin = taken.get(_name_key(cand))
+        if twin and snap[twin][0] == snap[rel][0] and _same_bytes(project_dir, twin, rel):
+            log(f"Not sending \"{rel}\" - its name doesn't work on Windows and the project already has "
+                f"the same file as \"{twin}\".")
+            continue
+        n = 2
+        stem, dot, ext = safe[-1].rpartition(".")
+        if not dot:
+            stem, ext = safe[-1], ""
+        while _name_key(cand) in taken:
+            last = f"{stem} ({n}).{ext}" if ext else f"{stem} ({n})"
+            cand = "/".join(safe[:-1] + [last])
+            n += 1
+        taken[_name_key(cand)] = rel
+        mapping[rel] = cand
+        log(f"\"{rel}\" is stored on the drive as \"{cand}\" (its name doesn't work on Windows).")
+    return mapping
+
+
+def _same_bytes(project_dir: Path, a: str, b: str) -> bool:
+    try:
+        return file_sha1(project_dir / Path(*a.split("/"))) == file_sha1(project_dir / Path(*b.split("/")))
+    except OSError:
+        return False
+
+
 def snapshot(folder: Path) -> dict[str, list]:
     """{relative/posix/path: [size, mtime]} for every file in a project folder."""
     out: dict[str, list] = {}
-    folder = Path(folder)
+    folder = pu.long_path(Path(folder))
     for dirpath, dirnames, filenames in os.walk(folder):
         dirnames[:] = [d for d in dirnames if not is_excluded(d)]
         rel_dir = Path(dirpath).relative_to(folder)
@@ -200,22 +291,17 @@ class Drive:
             key = os.path.normcase(str(proj))
             name = by_path.get(key)
             if name:
-                m = manifests[name]
-                if self.lock_info(name) or not drive_sets_changed(proj, m):
-                    continue
-                m.update(files=snapshot(proj), revision=m.get("revision", 0) + 1,
-                         pushed_at=_newest_set_time(proj), pushed_by=EDITED_ON_DRIVE,
-                         sets=[s.name for s in find_sets(proj)], main_set=find_sets(proj)[0].name)
-                self.write_manifest(name, m)
-                changed.append(name)
-                if log:
-                    log(f"\"{name}\" was changed directly on the drive - it now shows as a newer version.")
+                if self.refresh_project(name, manifests[name]):
+                    changed.append(name)
+                    if log:
+                        log(f"\"{name}\" was changed directly on the drive - it now shows as a newer version.")
                 continue
             name = self._unique_name(proj, taken)
             taken.add(name.lower())
             sets = find_sets(proj)
             self.write_manifest(name, {
                 "name": name,
+                "id": uuid.uuid4().hex,
                 "path": self.rel_path(proj),
                 "revision": 1,
                 "main_set": sets[0].name,
@@ -229,6 +315,21 @@ class Drive:
             if log:
                 log(f"Found \"{name}\" on the drive ({self.rel_path(proj)}).")
         return changed
+
+    def refresh_project(self, name: str, manifest: dict | None = None) -> bool:
+        """If this project's Live Sets were saved straight onto the drive (outside the app), record that
+        as a new version. Checked right before every Send and Get, not only when the list refreshes."""
+        m = manifest if manifest is not None else self.manifest(name)
+        if not m or self.lock_info(name):
+            return False
+        proj = self.project_path(name, m)
+        if not proj.is_dir() or not drive_sets_changed(proj, m):
+            return False
+        sets = find_sets(proj)
+        m.update(files=snapshot(proj), revision=m.get("revision", 0) + 1, pushed_at=_newest_set_time(proj),
+                 pushed_by=EDITED_ON_DRIVE, sets=[x.name for x in sets], main_set=sets[0].name)
+        self.write_manifest(name, m)
+        return True
 
     def _unique_name(self, proj: Path, taken: set[str]) -> str:
         base = safe_filename(proj.name)
@@ -392,47 +493,67 @@ class _Progress:
 
 # --------------------------------------------------------------------------- push
 
-def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution: str | None = None,
+def _same_folder(a, b) -> bool:
+    return os.path.normcase(str(Path(a))) == os.path.normcase(str(Path(b)))
+
+
+def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution=None,
          main_set: str | None = None, progress=None, log=None) -> PushResult:
     log = log or (lambda m: None)
+    res = _resolutions(resolution)
     project_dir = Path(project_dir)
     me = store.settings
     sets = find_sets(project_dir)
     if not sets:
         raise BridgeError(f"There's no Live Set (.als) in {project_dir}.")
     main = main_set or sets[0].name
+    had_id = read_project_id(project_dir)
 
-    drive_name = store.drive_name_for_local(project_dir) or safe_filename(project_dir.name)
-    st = store.project_state(drive_name)
+    # Which drive project is this folder? Only a link made for THIS folder and THIS song counts.
+    linked = store.drive_name_for_local(project_dir)
+    st = store.project_state(linked) if linked else None
+    if st and st.get("project_id") and st["project_id"] != had_id:
+        log(f"\"{project_dir.name}\" now holds a different song than the one it was synced with.")
+        store.forget_project(linked)
+        linked, st = None, None
+    drive_name = linked or safe_filename(project_dir.name)
+    if st is None and had_id:
+        other = store.project_state(drive_name)
+        if other and other.get("project_id") == had_id and not Path(other["local_path"]).exists():
+            st = other  # same song, folder was moved or renamed on this computer
+
+    drive.refresh_project(drive_name)
     manifest = drive.manifest(drive_name)
+    mid = (manifest or {}).get("id")
+    # Projects synced by an older version have no id yet: a linked folder takes the drive's id.
+    pid = had_id or (mid if st is not None and not st.get("project_id") and mid else None) or uuid.uuid4().hex
+    if pid != had_id:
+        write_project_id(project_dir, pid)
 
-    if manifest and resolution is None:
+    if manifest and not res:
         who = manifest.get("pushed_by", {}).get("name", "another computer")
         when = _fmt_time(manifest.get("pushed_at"))
-        if st is None:
+        where = f" (on the drive in {manifest['path']})" if manifest.get("path") else ""
+        if st is None or (mid and mid != pid):
             raise Conflict(
-                "name_taken", "A project with this name is already on the drive",
-                f"The drive already has a project called \"{drive_name}\" (sent from {who}, {when}). "
-                "It may be a different song with the same name.",
+                "name_taken", "A different project with this name is on the drive",
+                f"The drive already has a project called \"{drive_name}\"{where}, last saved by {who} ({when}). "
+                "It isn't this song's copy - it may be a different song with the same name.",
                 {"keep_both": "Send mine as a separate copy", "overwrite": "Replace the one on the drive"})
         if manifest.get("revision", 0) > st.get("revision", 0):
             raise Conflict(
                 "drive_newer", "The drive has a newer version",
-                f"{who} sent a newer version of \"{drive_name}\" ({when}) that you haven't opened on "
-                "this computer. Sending now would replace it.",
+                f"There's a newer version of \"{drive_name}\" on the drive ({who}, {when}) that you haven't "
+                "opened on this computer. Sending now would replace it.",
                 {"keep_both": "Send mine as a separate copy", "overwrite": "Replace it with mine"})
 
-    if resolution == "keep_both":
+    if "keep_both" in res:
         base = f"{drive_name} ({me.machine_name})"
         drive_name, n = safe_filename(base), 2
         while drive.manifest(drive_name) is not None:
             drive_name = safe_filename(f"{base} {n}")
             n += 1
-        manifest = None
-        # this local folder now belongs to the new drive copy
-        for name, pst in list(store.state["projects"].items()):
-            if os.path.normcase(pst.get("local_path", "")) == os.path.normcase(str(project_dir)):
-                del store.state["projects"][name]
+        manifest, mid = None, None
 
     lock = drive.lock_info(drive_name)
     if lock and lock.get("by") != me.machine_name and time.time() - lock.get("at", 0) < 60:
@@ -448,25 +569,36 @@ def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution: str 
         log(f"Warning: {err}")
 
     snap = snapshot(project_dir)
+    names = drive_names(project_dir, snap, log=log)
+    dsnap = {names[r]: snap[r] for r in names}
+    main_d = names.get(main, safe_filename(main, max_len=255))
     dest = drive.project_path(drive_name, manifest)
     old = (manifest or {}).get("files", {})
+    # Replacing a different song (or one we can't vouch for): copy everything, back up its sets.
+    replacing_other_song = bool(manifest) and ((mid is not None and mid != pid) or
+                                               ("overwrite" in res and st is None))
+    backup_drive_sets = replacing_other_song or "overwrite" in res
     to_copy = []
-    for rel, meta in snap.items():
-        target = dest / Path(*rel.split("/"))
+    for rel, drel in names.items():
+        target = dest / Path(*drel.split("/"))
         try:
-            on_drive_ok = target.is_file() and target.stat().st_size == meta[0]
+            on_drive_ok = target.is_file() and target.stat().st_size == snap[rel][0]
         except OSError:
             on_drive_ok = False
-        if not on_drive_ok or not same_meta(meta, old.get(rel)):
+        if replacing_other_song or not on_drive_ok or not same_meta(snap[rel], old.get(drel)):
             to_copy.append(rel)
     to_copy.sort(key=lambda r: (r.lower().endswith(".als"), r))  # Live Sets last
     total = sum(snap[r][0] for r in to_copy)
 
-    if manifest and not to_copy and set(snap) <= set(old) and manifest.get("main_set") == main:
+    if manifest and not to_copy and set(dsnap) <= set(old) and manifest.get("main_set") == main_d \
+            and mid in (None, pid):
         revision = manifest.get("revision", 0)
-        store.set_project_state(drive_name, project_dir, revision, snap)
+        if mid is None:
+            manifest["id"] = pid
+            drive.write_manifest(drive_name, manifest)
+        store.set_project_state(drive_name, project_dir, revision, snap, pid)
         log(f"\"{drive_name}\" on the drive is already up to date.")
-        return PushResult(drive_name, revision, main, 0, 0, collect)
+        return PushResult(drive_name, revision, main_d, 0, 0, collect)
 
     free = pu.free_space(drive.root)
     if 0 <= free < total + 50 * 1024 * 1024:
@@ -475,41 +607,70 @@ def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution: str 
 
     log(f"Copying {len(to_copy)} changed file(s) to the drive ({total / 1e6:.1f} MB)...")
     prog = _Progress(total, progress)
+    stamp = time.strftime("%Y-%m-%d %H%M%S")
     drive.lock(drive_name, me.machine_name)
     try:
         for rel in to_copy:
-            pu.copy_file(project_dir / Path(*rel.split("/")), dest / Path(*rel.split("/")), progress=prog,
-                         mtime=snap[rel][1])
+            drel = names[rel]
+            target = dest / Path(*drel.split("/"))
+            # Never lose a set that's on the drive: if we're about to replace a Live Set that isn't
+            # exactly the version this app last put there, keep a copy in the drive folder's Backup/.
+            if drel.lower().endswith(".als") and "/" not in drel and target.is_file():
+                st_t = target.stat()
+                if backup_drive_sets or not same_meta([st_t.st_size, st_t.st_mtime], old.get(drel)):
+                    pu.copy_file(target, dest / "Backup" / f"Before send {stamp}" / drel)
+            try:
+                pu.copy_file(project_dir / Path(*rel.split("/")), target, progress=prog, mtime=snap[rel][1])
+            except OSError as exc:
+                raise BridgeError(f"Couldn't copy \"{rel}\" to the drive ({exc.strerror or exc}). "
+                                  "Nothing on this computer was changed; fix that file and send again.") from exc
         revision = (manifest or {}).get("revision", 0) + 1
         drive.write_manifest(drive_name, {
             "name": drive_name,
+            "id": pid,
             "path": drive.rel_path(dest),
             "revision": revision,
-            "main_set": main,
-            "sets": [s.name for s in sets],
+            "main_set": main_d,
+            "sets": sorted({names[s.name] for s in sets if s.name in names}),
             "pushed_at": time.time(),
             "pushed_by": {"id": me.machine_id, "name": me.machine_name, "os": pu.os_key()},
-            "files": snap,
+            "files": dsnap,
         })
     finally:
         drive.unlock(drive_name)
-    store.set_project_state(drive_name, project_dir, revision, snap)
+    if replacing_other_song:
+        # Any other folder on this computer that was linked to the song that used to be there isn't anymore.
+        for name, pst in list(store.state["projects"].items()):
+            if name == drive_name and not _same_folder(pst.get("local_path", ""), project_dir):
+                store.forget_project(name)
+    store.set_project_state(drive_name, project_dir, revision, snap, pid)
     log(f"Sent \"{drive_name}\" to the drive (version {revision}).")
-    return PushResult(drive_name, revision, main, len(to_copy), total, collect)
+    return PushResult(drive_name, revision, main_d, len(to_copy), total, collect)
 
 
 # --------------------------------------------------------------------------- pull
 
-def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution: str | None = None,
+def _free_folder(base: Path) -> Path:
+    n = 2
+    cand = base
+    while cand.exists():
+        cand = base.with_name(f"{base.name} ({n})")
+        n += 1
+    return cand
+
+
+def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution=None,
          dest: Path | None = None, progress=None, log=None) -> PullResult:
     log = log or (lambda m: None)
+    res = _resolutions(resolution)
+    drive.refresh_project(drive_name)
     manifest = drive.manifest(drive_name)
     if not manifest:
         raise BridgeError(f"\"{drive_name}\" isn't on the drive.")
     src = drive.project_path(drive_name, manifest)
 
     lock = drive.lock_info(drive_name)
-    if lock and resolution is None:
+    if lock and "continue" not in res:
         raise Conflict(
             "incomplete", "The last send didn't finish",
             f"{lock.get('by', 'The other computer')} started sending \"{drive_name}\" but it didn't finish "
@@ -517,41 +678,84 @@ def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution: str | 
             "if you can.",
             {"continue": "Get the last complete version anyway"})
 
+    mid = manifest.get("id")
+    if not mid:
+        mid = uuid.uuid4().hex
+        if not lock:
+            manifest["id"] = mid
+            drive.write_manifest(drive_name, manifest)
+
     st = store.project_state(drive_name)
-    local = Path(st["local_path"]) if st else Path(dest or Path(store.settings.workspace) / drive_name)
+    if st and st.get("project_id") and st["project_id"] != mid:
+        log(f"A different song now uses the name \"{drive_name}\" on the drive - your own copy of the old one "
+            f"stays as it is.")
+        store.forget_project(drive_name)
+        st = None
+    if st and not Path(st["local_path"]).parent.exists():
+        st = None
+
+    def belongs_elsewhere(folder: Path) -> bool:
+        linked = store.drive_name_for_local(folder)
+        lid = read_project_id(folder) if folder.exists() else None
+        return (linked not in (None, drive_name)) or (lid is not None and lid != mid)
+
+    if st:
+        local = Path(st["local_path"])
+    else:
+        local = Path(dest) if dest else Path(store.settings.workspace) / drive_name
+        if local.exists() and belongs_elsewhere(local):
+            new_local = _free_folder(local)
+            log(f"\"{local.name}\" on this computer is a different song - getting this one as "
+                f"\"{new_local.name}\" instead.")
+            local = new_local
     revision = manifest.get("revision", 0)
     files: dict = manifest.get("files", {})
-    backup_all = False
+    backup_all = "backup_and_get" in res
+    changed_here: set[str] = set()
 
     if local.exists():
         snap = snapshot(local)
         if st:
             local_changes = changed_files(snap, st.get("files", {}))
+            changed_here = set(local_changes)
             if local_changes and revision <= st.get("revision", 0):
                 log("This computer already has the newest version (plus changes not sent yet).")
                 return PullResult(drive_name, local, _main_set_path(local, manifest), 0, 0, already_current=True)
-            if local_changes and resolution is None:
+            if local_changes and not res & {"backup_and_get", "keep_both"}:
                 raise Conflict(
                     "both_changed", "Changed on both computers",
-                    f"\"{drive_name}\" was changed on this computer since it was last synced, and "
-                    f"{manifest.get('pushed_by', {}).get('name', 'the other computer')} sent a newer version. "
+                    f"\"{drive_name}\" was changed on this computer since it was last synced, and there's a newer "
+                    f"version on the drive ({manifest.get('pushed_by', {}).get('name', 'the other computer')}). "
                     f"Changed here: {', '.join(local_changes[:4])}{'...' if len(local_changes) > 4 else ''}",
-                    {"backup_and_get": "Back up my changes, then get the drive version"})
+                    {"keep_both": "Keep mine and get theirs as a separate copy",
+                     "backup_and_get": "Get theirs here (my changes go to Backup)"})
         else:
             differs = changed_files({k: v for k, v in snap.items() if k in files}, files)
-            if differs and resolution is None:
+            changed_here = set(differs)
+            if differs and not res & {"backup_and_get", "keep_both"}:
                 raise Conflict(
                     "local_exists", "There's already a project with this name here",
-                    f"{local} already exists on this computer and isn't the same as the drive version.",
-                    {"backup_and_get": "Back up the local one, then get the drive version"})
-        backup_all = resolution == "backup_and_get"
+                    f"{local} already exists on this computer and isn't the same as the drive version. "
+                    "If it's a different song, get the drive one as a separate copy.",
+                    {"keep_both": "Get it as a separate copy",
+                     "backup_and_get": "It's the same song - update it (my version goes to Backup)"})
+        if "keep_both" in res and (changed_here or not st):
+            new_local = _free_folder(local)
+            log(f"Keeping \"{local.name}\" as it is - getting the drive version as \"{new_local.name}\".")
+            if st:
+                # my folder keeps its changes but is no longer linked to the drive project
+                store.forget_project(drive_name)
+                st = None
+            local, snap, changed_here, backup_all = new_local, {}, set(), False
     else:
         snap = {}
 
     to_copy = [rel for rel, meta in files.items() if not same_meta(snap.get(rel), meta)]
     to_copy.sort(key=lambda r: (r.lower().endswith(".als"), r))
     if not to_copy and local.exists():
-        store.set_project_state(drive_name, local, revision, snapshot(local))
+        if read_project_id(local) != mid:
+            write_project_id(local, mid)
+        store.set_project_state(drive_name, local, revision, snapshot(local), mid)
         log("Already up to date.")
         return PullResult(drive_name, local, _main_set_path(local, manifest), 0, 0, already_current=True)
 
@@ -567,16 +771,23 @@ def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution: str | 
     for rel in to_copy:
         s = src / Path(*rel.split("/"))
         d = local / Path(*rel.split("/"))
-        if not s.is_file():
+        if not pu.long_path(s).is_file():
             missing.append(rel)
             continue
-        if d.exists() and (backup_all or rel.lower().endswith(".als")):
-            b = local / "Backup" / f"Before getting from drive {stamp}" / Path(*rel.split("/"))
-            pu.copy_file(d, b)
+        # Back up anything of mine that's about to be replaced: every Live Set, and every file
+        # that was changed on this computer since the last sync.
+        if pu.long_path(d).exists() and (backup_all or rel in changed_here or rel.lower().endswith(".als")):
+            pu.copy_file(d, local / "Backup" / f"Before get {stamp}" / Path(*rel.split("/")))
             backups.append(rel)
-        pu.copy_file(s, d, progress=prog, mtime=files[rel][1])
+        try:
+            pu.copy_file(s, d, progress=prog, mtime=files[rel][1])
+        except OSError as exc:
+            raise BridgeError(f"Couldn't copy \"{rel}\" to this computer ({exc.strerror or exc}). "
+                              "Try again; files already copied are kept.") from exc
     if missing:
         log(f"Warning: {len(missing)} file(s) listed for this project are missing from the drive.")
+    if read_project_id(local) != mid:
+        write_project_id(local, mid)
     # Samples that the set points to elsewhere on the drive (e.g. a sample library folder on it)
     # or that were never collected: pack them in now so the set opens complete.
     s = store.settings
@@ -590,7 +801,7 @@ def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution: str | 
             log(f"Warning: {err}")
     except Exception as exc:  # noqa: BLE001 - the project is already copied; never fail the Get here
         log(f"Warning: couldn't pack outside samples into the project ({exc}).")
-    store.set_project_state(drive_name, local, revision, snapshot(local))
+    store.set_project_state(drive_name, local, revision, snapshot(local), mid)
     log(f"Got \"{drive_name}\" version {revision} -> {local}")
     return PullResult(drive_name, local, _main_set_path(local, manifest), len(to_copy) - len(missing), total,
                       backups, missing)
@@ -624,6 +835,7 @@ class ProjectRow:
     local_dir: Path | None = None
     manifest: dict | None = None
     local_mtime: float = 0.0
+    label: str = ""  # what the list shows (adds the parent folder when two local folders share a name)
 
     @property
     def status_text(self) -> str:
@@ -692,6 +904,16 @@ def newest_set(roots: list[Path], skip: list[Path] | None = None) -> Path | None
     return best
 
 
+def relink_moved(store: LocalStore, folder: Path, pid: str) -> str | None:
+    """A synced project folder that was moved or renamed on this computer keeps its link (found by its id)."""
+    for name, st in store.state["projects"].items():
+        if st.get("project_id") == pid and not Path(st.get("local_path", "")).exists():
+            st["local_path"] = str(folder)
+            store.save_state()
+            return name
+    return None
+
+
 def project_rows(store: LocalStore, drive: Drive | None, rescan: bool = False) -> list[ProjectRow]:
     if drive:
         drive.scan_existing(force=rescan)
@@ -704,15 +926,22 @@ def project_rows(store: LocalStore, drive: Drive | None, rescan: bool = False) -
         if e.is_dir() and os.path.normcase(str(e.resolve())) not in seen and find_sets(e):
             local_dirs.append(e)
 
-    rows: dict[str, ProjectRow] = {}
+    rows: list[ProjectRow] = []
     for d in local_dirs:
-        name = store.drive_name_for_local(d) or safe_filename(d.name)
-        st = store.project_state(name)
+        linked = store.drive_name_for_local(d)
+        lid = read_project_id(d)
+        if not linked and lid:
+            linked = relink_moved(store, d, lid)
+        name = linked or safe_filename(d.name)
+        st = store.project_state(linked) if linked else None
         man = manifests.get(name)
+        if st and man and st.get("project_id") and man.get("id") and st["project_id"] != man["id"]:
+            st = None  # a different song now uses that name on the drive
         sets = find_sets(d)
         mtime = sets[0].stat().st_mtime if sets else 0.0
-        if man is None:
-            status = "local_only"
+        if man is None or (st is None and lid and man.get("id") and lid != man["id"]):
+            status = "local_only"  # nothing on the drive, or only a different song with the same name
+            man = None
         elif st is None:
             status = "unlinked"
         else:
@@ -720,14 +949,18 @@ def project_rows(store: LocalStore, drive: Drive | None, rescan: bool = False) -
             drive_newer = man.get("revision", 0) > st.get("revision", 0)
             status = ("conflict" if local_changed and drive_newer else "drive_newer" if drive_newer
                       else "local_newer" if local_changed else "synced")
-        if name in rows:  # two local folders with the same name: keep the newest
-            if rows[name].local_mtime >= mtime:
-                continue
-        rows[name] = ProjectRow(name, status, d, man, mtime)
+        rows.append(ProjectRow(name, status, d, man, mtime, name))
+    counts: dict[str, int] = {}
+    for r in rows:
+        counts[r.name.lower()] = counts.get(r.name.lower(), 0) + 1
+    for r in rows:
+        if counts[r.name.lower()] > 1:
+            r.label = f"{r.name}  ({r.local_dir.parent.name})"
+    covered = {r.name for r in rows if r.status != "local_only"}
     for name, man in manifests.items():
-        if name not in rows:
-            rows[name] = ProjectRow(name, "drive_only", None, man)
-    return sorted(rows.values(), key=lambda r: max(r.local_mtime, r.sent_at), reverse=True)
+        if name not in covered:
+            rows.append(ProjectRow(name, "drive_only", None, man, 0.0, name))
+    return sorted(rows, key=lambda r: max(r.local_mtime, r.sent_at), reverse=True)
 
 
 def machine_record(store: LocalStore, inventory: dict, live_versions: list[str]) -> dict:

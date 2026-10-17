@@ -461,7 +461,7 @@ class App(tk.Tk):
             if r.manifest and r.manifest.get("pushed_by", {}).get("id") == "drive":
                 folder = r.manifest.get("path", "").rsplit("/", 1)[0] if "/" in r.manifest.get("path", "") else ""
                 by = f"drive: {folder or 'top level'}"
-            self.tree.insert("", "end", iid=str(i), text="   " + r.name,
+            self.tree.insert("", "end", iid=str(i), text="   " + (r.label or r.name),
                              values=(f"{STATUS_ICONS[r.status]}  {STATUS_TEXT[r.status]}",
                                      ago(r.sent_at), by, local), tags=(r.status,))
             if r.name == sel_name:
@@ -524,12 +524,12 @@ class App(tk.Tk):
         if r and r.local_dir:
             self._send(r.local_dir)
 
-    def _send(self, project_dir: Path, resolution: str | None = None):
+    def _send(self, project_dir: Path, resolution: tuple = ()):
         def work(progress, log):
             return self.bridge.send(project_dir, resolution=resolution, progress=progress, log=log)
 
         self.run_task(f"Sending \"{project_dir.name}\" to the drive...", work, done=self._sent,
-                      retry=lambda res: self._send(project_dir, res))
+                      retry=lambda res: self._send(project_dir, (*resolution, res)))
 
     def _sent(self, result):
         rep = result.report
@@ -573,12 +573,12 @@ class App(tk.Tk):
         if r and r.manifest:
             self._get(r.name)
 
-    def _get(self, name: str, resolution: str | None = None):
+    def _get(self, name: str, resolution: tuple = ()):
         def work(progress, log):
             return self.bridge.get(name, resolution=resolution, progress=progress, log=log)
 
         self.run_task(f"Getting \"{name}\" from the drive...", work, done=self._got,
-                      retry=lambda res: self._get(name, res))
+                      retry=lambda res: self._get(name, (*resolution, res)))
 
     def _got(self, result):
         me = self.bridge.store.settings.machine_id

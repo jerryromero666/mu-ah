@@ -268,7 +268,7 @@ def collect_project(project_dir: Path, *, search_dirs: list[Path] | None = None,
                 if not name_is_portable(rel):
                     if edit:
                         rel = importer.import_file(found, ref.kind)
-                        log(f"Renamed for Windows: {found.name} -> {rel}")
+                        log(f"Copied {found.name} to {rel} (its name doesn't work on Windows)")
                     else:
                         rel = "(renamed for Windows) " + rel
             elif not include_core_library and is_core_library(found):
