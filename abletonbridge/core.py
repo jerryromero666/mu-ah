@@ -89,8 +89,8 @@ class Bridge:
     def roots(self) -> list[Path]:
         return [Path(r) for r in self.store.settings.project_roots] + [Path(self.store.settings.workspace)]
 
-    def rows(self):
-        return project_rows(self.store, self.drive)
+    def rows(self, rescan: bool = False):
+        return project_rows(self.store, self.drive, rescan=rescan)
 
     def current_project(self) -> Path | None:
         """The project whose Live Set was saved most recently on this computer."""
@@ -133,7 +133,12 @@ class Bridge:
 
     def get(self, drive_name: str, resolution: str | None = None, progress=None, log=None) -> PullResult:
         drive = self.require_drive()
-        result = pull(self.store, drive, drive_name, resolution=resolution, progress=progress, log=log)
+        dest = None
+        if self.store.project_state(drive_name) is None:
+            # Same project already on this computer (e.g. copied by hand before)? Update that copy.
+            dest = next((r.local_dir for r in self.rows() if r.name == drive_name and r.local_dir), None)
+        result = pull(self.store, drive, drive_name, resolution=resolution, dest=dest, progress=progress,
+                      log=log)
         me = [m for m in self.machines() if m.id == self.store.settings.machine_id]
         result.report = build_report(result.local_dir, me, search_dirs=self.store.settings.sample_search_dirs)
         return result

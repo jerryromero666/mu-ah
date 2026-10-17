@@ -71,6 +71,23 @@ samples, and you find out about missing plugins before you open the set.
 6. If your projects live somewhere other than `Music` or `Documents`, add that folder under
    **Settings → Folders with your Ableton projects**.
 
+## Already have projects on your drive?
+
+You don't need to move anything. When you set up a drive that already has Ableton projects on it:
+
+- Every project folder anywhere on the drive shows up in the list as **Only on the drive**.
+- **Get & Open** copies one to this computer. Samples the set points to elsewhere on the drive
+  (for example a sample library folder) are packed into the project, whether the set was last
+  saved on the Mac (`/Volumes/...`) or on the PC (`E:\...`).
+- **Send** puts the project back **in its original folder on the drive**, not in a new one.
+- If you open a project straight from the drive in Live and save it there, the app notices and
+  shows it as a newer version.
+- Two folders with the same name (e.g. two `Untitled Project`s) get told apart by their parent folder.
+- If the same project is already on this computer, Get updates that copy and backs up anything
+  that differs first.
+
+Keep each song in its own folder. Loose `.als` files at the very top of the drive are ignored.
+
 ## Day to day
 
 - On the computer you worked on: save in Live (or let the app do it) and click **↑ Send to Drive**.

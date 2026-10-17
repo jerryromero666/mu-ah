@@ -80,7 +80,15 @@ def snapshot(folder: Path) -> dict[str, list]:
 
 
 def same_meta(a, b) -> bool:
-    return bool(a) and bool(b) and a[0] == b[0] and abs(a[1] - b[1]) <= MTIME_TOLERANCE
+    if not (a and b) or a[0] != b[0]:
+        return False
+    diff = abs(a[1] - b[1])
+    if diff <= MTIME_TOLERANCE:
+        return True
+    # FAT drives store local time, so the same file can look whole hours older/newer on the other
+    # computer (time zone / daylight saving). Same size + whole-hour shift = same file.
+    hours = round(diff / 3600)
+    return 1 <= hours <= 14 and abs(diff - hours * 3600) <= MTIME_TOLERANCE
 
 
 def changed_files(current: dict, baseline: dict) -> list[str]:
@@ -107,11 +115,131 @@ def _fmt_time(ts: float | None) -> str:
 
 # --------------------------------------------------------------------------- the drive
 
+UNTRACKED_SENDER = {"id": "drive", "name": "already on the drive", "os": ""}
+EDITED_ON_DRIVE = {"id": "drive", "name": "edited on the drive", "os": ""}
+SCAN_CACHE_SECONDS = 30
+
+
+def drive_sets_changed(project_dir: Path, manifest: dict) -> bool:
+    """Was a Live Set in this drive folder saved by something other than Ableton Bridge
+    (e.g. Live opened the project straight from the drive)?
+
+    Old sets left on the drive that are no longer in the manifest don't count; a set
+    that's newer than the last send does.
+    """
+    files = manifest.get("files", {})
+    sent_at = manifest.get("pushed_at", 0)
+    for s in find_sets(project_dir):
+        try:
+            st = s.stat()
+        except OSError:
+            continue
+        known = files.get(s.name)
+        if known is not None:
+            if not same_meta([st.st_size, st.st_mtime], known):
+                return True
+        elif st.st_mtime > sent_at + 5:
+            return True
+    return False
+
+
 class Drive:
     def __init__(self, bridge_dir: Path):
         self.root = Path(bridge_dir)
         self.projects_dir = self.root / "Projects"
         self.meta_dir = self.root / "_bridge"
+        self._scanned_at = 0.0
+        self.scan_notes: list[str] = []
+
+    @property
+    def home(self) -> Path:
+        """The folder the AbletonBridge folder sits in (normally the top of the drive)."""
+        return self.root.parent
+
+    @property
+    def volume(self) -> Path:
+        return pu.volume_root(self.root)
+
+    @property
+    def search_roots(self) -> list[Path]:
+        """Where '/Volumes/<drive>/...' or 'E:/...' paths written by the other computer map to here."""
+        roots = [self.home]
+        if os.path.normcase(str(self.volume)) != os.path.normcase(str(self.home)):
+            roots.append(self.volume)
+        return roots
+
+    def project_path(self, name: str, manifest: dict | None = None) -> Path:
+        """Where a project lives on the drive: its original folder for projects that were already
+        on the drive, AbletonBridge/Projects/<name> for ones sent by the app."""
+        manifest = manifest if manifest is not None else self.manifest(name)
+        rel = (manifest or {}).get("path")
+        if rel:
+            return self.home / Path(*rel.split("/"))
+        return self.projects_dir / name
+
+    def rel_path(self, folder: Path) -> str:
+        return Path(folder).relative_to(self.home).as_posix()
+
+    def scan_existing(self, force: bool = False, log=None) -> list[str]:
+        """Find Ableton projects anywhere on the drive that the app doesn't know about yet,
+        and notice projects that were edited directly on the drive. Returns names it added/updated."""
+        if not force and time.time() - self._scanned_at < SCAN_CACHE_SECONDS:
+            return []
+        self._scanned_at = time.time()
+        self.scan_notes = []
+        manifests = self.manifests()
+        by_path = {}
+        for name, m in manifests.items():
+            by_path[os.path.normcase(str(self.project_path(name, m)))] = name
+        taken = {n.lower() for n in manifests}
+        changed = []
+        if find_sets(self.home):
+            self.scan_notes.append("There are Live Sets loose at the top of the drive - put each song in "
+                                   "its own folder so Ableton Bridge can pick it up.")
+        for proj in discover_projects([self.home], max_depth=8, skip=[self.meta_dir]):
+            key = os.path.normcase(str(proj))
+            name = by_path.get(key)
+            if name:
+                m = manifests[name]
+                if self.lock_info(name) or not drive_sets_changed(proj, m):
+                    continue
+                m.update(files=snapshot(proj), revision=m.get("revision", 0) + 1,
+                         pushed_at=_newest_set_time(proj), pushed_by=EDITED_ON_DRIVE,
+                         sets=[s.name for s in find_sets(proj)], main_set=find_sets(proj)[0].name)
+                self.write_manifest(name, m)
+                changed.append(name)
+                if log:
+                    log(f"\"{name}\" was changed directly on the drive - it now shows as a newer version.")
+                continue
+            name = self._unique_name(proj, taken)
+            taken.add(name.lower())
+            sets = find_sets(proj)
+            self.write_manifest(name, {
+                "name": name,
+                "path": self.rel_path(proj),
+                "revision": 1,
+                "main_set": sets[0].name,
+                "sets": [s.name for s in sets],
+                "pushed_at": _newest_set_time(proj),
+                "pushed_by": UNTRACKED_SENDER,
+                "files": snapshot(proj),
+            })
+            by_path[key] = name
+            changed.append(name)
+            if log:
+                log(f"Found \"{name}\" on the drive ({self.rel_path(proj)}).")
+        return changed
+
+    def _unique_name(self, proj: Path, taken: set[str]) -> str:
+        base = safe_filename(proj.name)
+        if base.lower() not in taken:
+            return base
+        cand = safe_filename(f"{proj.name} ({proj.parent.name})")
+        n = 2
+        while cand.lower() in taken:
+            cand = safe_filename(f"{proj.name} ({proj.parent.name} {n})")
+            n += 1
+        return cand
 
     @classmethod
     def initialize(cls, location: Path) -> "Drive":
@@ -312,14 +440,15 @@ def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution: str 
 
     log(f"Collecting samples and devices into \"{project_dir.name}\"...")
     collect = collect_project(project_dir, search_dirs=[Path(d) for d in me.sample_search_dirs],
-                              include_core_library=me.collect_core_library, log=log)
+                              include_core_library=me.collect_core_library, volume_roots=drive.search_roots,
+                              log=log)
     if collect.files_copied:
         log(f"Collected {len(collect.files_copied)} file(s) into the project folder.")
     for err in collect.errors:
         log(f"Warning: {err}")
 
     snap = snapshot(project_dir)
-    dest = drive.projects_dir / drive_name
+    dest = drive.project_path(drive_name, manifest)
     old = (manifest or {}).get("files", {})
     to_copy = []
     for rel, meta in snap.items():
@@ -354,6 +483,7 @@ def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution: str 
         revision = (manifest or {}).get("revision", 0) + 1
         drive.write_manifest(drive_name, {
             "name": drive_name,
+            "path": drive.rel_path(dest),
             "revision": revision,
             "main_set": main,
             "sets": [s.name for s in sets],
@@ -371,12 +501,12 @@ def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution: str 
 # --------------------------------------------------------------------------- pull
 
 def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution: str | None = None,
-         progress=None, log=None) -> PullResult:
+         dest: Path | None = None, progress=None, log=None) -> PullResult:
     log = log or (lambda m: None)
     manifest = drive.manifest(drive_name)
     if not manifest:
         raise BridgeError(f"\"{drive_name}\" isn't on the drive.")
-    src = drive.projects_dir / drive_name
+    src = drive.project_path(drive_name, manifest)
 
     lock = drive.lock_info(drive_name)
     if lock and resolution is None:
@@ -388,7 +518,7 @@ def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution: str | 
             {"continue": "Get the last complete version anyway"})
 
     st = store.project_state(drive_name)
-    local = Path(st["local_path"]) if st else Path(store.settings.workspace) / drive_name
+    local = Path(st["local_path"]) if st else Path(dest or Path(store.settings.workspace) / drive_name)
     revision = manifest.get("revision", 0)
     files: dict = manifest.get("files", {})
     backup_all = False
@@ -447,6 +577,13 @@ def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution: str | 
         pu.copy_file(s, d, progress=prog, mtime=files[rel][1])
     if missing:
         log(f"Warning: {len(missing)} file(s) listed for this project are missing from the drive.")
+    # Samples that the set points to elsewhere on the drive (e.g. a sample library folder on it)
+    # or that were never collected: pack them in now so the set opens complete.
+    s = store.settings
+    collect = collect_project(local, search_dirs=[Path(d) for d in s.sample_search_dirs],
+                              include_core_library=s.collect_core_library, volume_roots=drive.search_roots, log=log)
+    if collect.files_copied:
+        log(f"Packed {len(collect.files_copied)} sample(s) from elsewhere on the drive into the project.")
     store.set_project_state(drive_name, local, revision, snapshot(local))
     log(f"Got \"{drive_name}\" version {revision} -> {local}")
     return PullResult(drive_name, local, _main_set_path(local, manifest), len(to_copy) - len(missing), total,
@@ -495,20 +632,31 @@ class ProjectRow:
         return (self.manifest or {}).get("pushed_at", 0.0)
 
 
-def discover_projects(roots: list[Path], max_depth: int = 4, skip: list[Path] | None = None) -> list[Path]:
+SKIP_DIRS = {"$RECYCLE.BIN", "System Volume Information", "Backup", "Ableton Project Info", "Samples",
+             "Library", "Applications", "Program Files", "Windows", "node_modules"}
+
+
+def discover_projects(roots: list[Path], max_depth: int = 4, skip: list[Path] | None = None,
+                      max_dirs: int = 30000) -> list[Path]:
     found, seen = [], set()
     skip_norm = {os.path.normcase(str(Path(s).resolve())) for s in (skip or [])}
+    visited = 0
     for root in roots:
         root = Path(root)
         if not root.is_dir():
             continue
         base_depth = len(root.parts)
         for dirpath, dirnames, filenames in os.walk(root):
+            visited += 1
+            if visited > max_dirs:
+                break
             here = Path(dirpath)
             if os.path.normcase(str(here.resolve())) in skip_norm:
                 dirnames[:] = []
                 continue
-            if any(f.lower().endswith(".als") and not f.startswith("._") for f in filenames):
+            # A searched folder itself (Desktop, the top of the drive) is never "a project",
+            # even with loose sets in it - only folders inside it are.
+            if here != root and any(f.lower().endswith(".als") and not f.startswith("._") for f in filenames):
                 key = os.path.normcase(str(here.resolve()))
                 if key not in seen:
                     seen.add(key)
@@ -518,9 +666,14 @@ def discover_projects(roots: list[Path], max_depth: int = 4, skip: list[Path] | 
             if len(here.parts) - base_depth >= max_depth:
                 dirnames[:] = []
             else:
-                dirnames[:] = [d for d in dirnames if not d.startswith((".", "_")) and d != "Backup"
-                               and not d.endswith((".app", ".bundle"))]
+                dirnames[:] = [d for d in dirnames if not d.startswith((".", "_")) and d not in SKIP_DIRS
+                               and not d.endswith((".app", ".bundle", ".vst3", ".component"))]
     return found
+
+
+def _newest_set_time(folder: Path) -> float:
+    sets = find_sets(folder)
+    return sets[0].stat().st_mtime if sets else time.time()
 
 
 def newest_set(roots: list[Path], skip: list[Path] | None = None) -> Path | None:
@@ -533,7 +686,9 @@ def newest_set(roots: list[Path], skip: list[Path] | None = None) -> Path | None
     return best
 
 
-def project_rows(store: LocalStore, drive: Drive | None) -> list[ProjectRow]:
+def project_rows(store: LocalStore, drive: Drive | None, rescan: bool = False) -> list[ProjectRow]:
+    if drive:
+        drive.scan_existing(force=rescan)
     manifests = drive.manifests() if drive else {}
     roots = [Path(r) for r in store.settings.project_roots] + [Path(store.settings.workspace)]
     extra = [Path(p["local_path"]) for p in store.state["projects"].values()]

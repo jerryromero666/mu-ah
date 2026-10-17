@@ -297,3 +297,109 @@ def test_junk_cleanup(tmp_path):
     write(drive.projects_dir / "P" / "Song.als")
     assert drive.clean_junk() == 2
     assert (drive.projects_dir / "P" / "Song.als").exists()
+
+
+# ----------------------------------------------------------------------------- projects already on the drive
+
+def existing_drive(tmp_path):
+    usb = tmp_path / "USB"
+    write(usb / "SampleLib" / "kick.wav", b"K" * 40)
+    write(usb / "SampleLib" / "snare.wav", b"S" * 30)
+    old = usb / "Music" / "Old Song Project"
+    write(old / "Samples" / "Recorded" / "vox.wav", b"V" * 20)
+    make_set(old / "Old Song.als", [
+        audio_track("Kick", modern_fileref("", "/Volumes/USB/SampleLib/kick.wav", 1, 40)),   # saved on the Mac
+        audio_track("Snare", modern_fileref("", "E:/SampleLib/snare.wav", 1, 30)),           # saved on the PC
+        audio_track("Vox", modern_fileref("Samples/Recorded/vox.wav", "/x/vox.wav", 3, 20)),
+    ])
+    for folder in ("Beats", "Remixes"):
+        make_set(usb / folder / "Untitled Project" / "Untitled.als", [])
+    make_set(usb / "Loose.als", [])  # loose set at the top of the drive: ignored, not swallowed
+    return usb, Drive.initialize(usb)
+
+
+def test_existing_projects_on_drive_are_found(tmp_path):
+    mac, pc = stores(tmp_path)
+    usb, drive = existing_drive(tmp_path)
+    rows = {r.name: r for r in project_rows(pc, drive, rescan=True)}
+    assert set(rows) == {"Old Song Project", "Untitled Project", "Untitled Project (Remixes)"}
+    assert rows["Old Song Project"].status == "drive_only"
+    assert rows["Old Song Project"].manifest["path"] == "Music/Old Song Project"
+    assert drive.scan_notes and "loose" in drive.scan_notes[0]
+    # rescanning doesn't duplicate or bump anything
+    drive.scan_existing(force=True)
+    assert drive.manifest("Old Song Project")["revision"] == 1
+
+
+def test_get_existing_project_and_send_back_to_its_folder(tmp_path):
+    mac, pc = stores(tmp_path)
+    usb, drive = existing_drive(tmp_path)
+    drive.scan_existing(force=True)
+
+    got = pull(pc, drive, "Old Song Project")
+    local = got.local_dir
+    assert got.main_set == local / "Old Song.als"
+    # samples elsewhere on the drive (Mac and PC style paths) were packed into the project
+    assert (local / "Samples" / "Imported" / "kick.wav").read_bytes() == b"K" * 40
+    assert (local / "Samples" / "Imported" / "snare.wav").is_file()
+    assert collect_project(local).missing == []
+    assert {r.name: r for r in project_rows(pc, drive)}["Old Song Project"].status == "synced"
+
+    # edit + send: goes back into Music/Old Song Project, not AbletonBridge/Projects
+    st = (local / "Old Song.als").stat()
+    os.utime(local / "Old Song.als", (st.st_mtime + 100, st.st_mtime + 100))
+    res = push(pc, drive, local)
+    assert res.revision == 2
+    assert (usb / "Music" / "Old Song Project" / "Samples" / "Imported" / "kick.wav").is_file()
+    assert not (drive.projects_dir / "Old Song Project").exists()
+
+    # the Mac gets it from the drive and everything resolves there too
+    got_mac = pull(mac, drive, "Old Song Project")
+    assert collect_project(got_mac.local_dir).missing == []
+
+
+def test_project_edited_directly_on_drive(tmp_path):
+    mac, pc = stores(tmp_path)
+    usb, drive = existing_drive(tmp_path)
+    drive.scan_existing(force=True)
+    pull(pc, drive, "Old Song Project")
+    on_drive = usb / "Music" / "Old Song Project" / "Old Song.als"
+    st = on_drive.stat()
+    # an old, forgotten set in the folder must not count as an edit
+    make_set(on_drive.parent / "Old Song old.als", [])
+    os.utime(on_drive.parent / "Old Song old.als", (st.st_mtime - 9999, st.st_mtime - 9999))
+    assert drive.scan_existing(force=True) == []
+    # Live saved the set straight onto the drive
+    os.utime(on_drive, (st.st_mtime + 500, st.st_mtime + 500))
+    assert drive.scan_existing(force=True) == ["Old Song Project"]
+    row = {r.name: r for r in project_rows(pc, drive)}["Old Song Project"]
+    assert row.status == "drive_newer" and row.sent_by == "edited on the drive"
+
+
+def test_fat_timezone_shift_is_not_a_change():
+    from abletonbridge.sync import same_meta
+    assert same_meta([10, 1000.0], [10, 1000.0 + 3600])
+    assert same_meta([10, 1000.0], [10, 1001.5])
+    assert not same_meta([10, 1000.0], [10, 1000.0 + 1800])
+    assert not same_meta([10, 1000.0], [11, 1000.0])
+
+
+def test_get_into_existing_local_copy(tmp_path):
+    from abletonbridge.core import Bridge
+    mac, pc = stores(tmp_path)
+    usb, drive = existing_drive(tmp_path)
+    # the user already copied this project to the PC by hand, and changed it
+    import shutil
+    mine = Path(pc.settings.workspace) / "Mixes" / "Old Song Project"
+    shutil.copytree(usb / "Music" / "Old Song Project", mine)
+    st = (mine / "Old Song.als").stat()
+    os.utime(mine / "Old Song.als", (st.st_mtime + 50, st.st_mtime + 50))
+    b = Bridge(pc)
+    b.drive = drive
+    assert {r.name: r for r in b.rows(rescan=True)}["Old Song Project"].status == "unlinked"
+    with pytest.raises(Conflict) as exc:
+        b.get("Old Song Project")
+    assert exc.value.kind == "local_exists"
+    res = b.get("Old Song Project", resolution="backup_and_get")
+    assert res.local_dir == mine and "Old Song.als" in res.backups
+    assert {r.name: r for r in b.rows()}["Old Song Project"].status == "synced"

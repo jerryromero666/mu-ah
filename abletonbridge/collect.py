@@ -149,8 +149,27 @@ class FileFinder:
         return paths[0]
 
 
-def resolve(ref: FileRef, project_dir: Path, finder: FileFinder) -> Path | None:
-    for cand in ref.candidates(project_dir):
+_VOLUME_PREFIX = re.compile(r"^(?:/Volumes/[^/]+/|[A-Za-z]:/|/media/[^/]+/[^/]+/|/run/media/[^/]+/[^/]+/|/mnt/[^/]+/)")
+
+
+def remap_to_volumes(abs_path: str, volume_roots: list[Path]) -> list[Path]:
+    """'/Volumes/MyDrive/Samples/x.wav' or 'E:/Samples/x.wav' -> '<drive as mounted here>/Samples/x.wav'."""
+    p = abs_path.replace("\\", "/")
+    m = _VOLUME_PREFIX.match(p)
+    if not m:
+        return []
+    rest = p[m.end():]
+    if not rest:
+        return []
+    return [Path(root, *rest.split("/")) for root in volume_roots]
+
+
+def resolve(ref: FileRef, project_dir: Path, finder: FileFinder,
+            volume_roots: list[Path] | None = None) -> Path | None:
+    cands = ref.candidates(project_dir)
+    if volume_roots and ref.abs_path:
+        cands += remap_to_volumes(ref.abs_path, volume_roots)
+    for cand in cands:
         try:
             if cand.is_file():
                 return cand
@@ -212,6 +231,7 @@ def backup_set(set_path: Path, reason: str = "before Ableton Bridge") -> Path:
 
 def collect_project(project_dir: Path, *, search_dirs: list[Path] | None = None,
                     include_core_library: bool = True, dry_run: bool = False,
+                    volume_roots: list[Path] | None = None,
                     progress=None, log=None) -> CollectResult:
     """Copy everything the project's sets use into the project and point the sets at the copies."""
     project_dir = Path(project_dir)
@@ -230,7 +250,7 @@ def collect_project(project_dir: Path, *, search_dirs: list[Path] | None = None,
         for ref in als.filerefs():
             if ref.informational or ref.empty:
                 continue
-            found = resolve(ref, project_dir, finder)
+            found = resolve(ref, project_dir, finder, volume_roots)
             if found is None:
                 result.missing.append(MissingFile(set_path.name, ref.filename, ref.abs_path or ref.relative_path,
                                                   ref.kind))

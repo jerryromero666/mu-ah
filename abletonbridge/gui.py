@@ -182,7 +182,7 @@ class App(tk.Tk):
         top = tk.Frame(body, bg=BG)
         top.pack(fill="x", pady=(0, 6))
         tk.Label(top, text="Projects", bg=BG, fg=TEXT, font=(FAMILY, 13, "bold")).pack(side="left")
-        ttk.Button(top, text="Refresh", command=self.refresh).pack(side="right")
+        ttk.Button(top, text="Refresh", command=lambda: self.refresh(rescan=True)).pack(side="right")
 
         table = tk.Frame(body, bg=PANEL)
         table.pack(fill="both", expand=True)
@@ -334,7 +334,10 @@ class App(tk.Tk):
     def _startup(self):
         def work(progress, log):
             self.bridge.publish_machine(log=log)
-            return self.bridge.rows()
+            rows = self.bridge.rows(rescan=True)
+            for note in (self.bridge.drive.scan_notes if self.bridge.drive else []):
+                log(note)
+            return rows
 
         def done(rows):
             self._fill(rows)
@@ -363,7 +366,7 @@ class App(tk.Tk):
             threading.Thread(target=lambda: self.bridge.publish_machine(), daemon=True).start()
         else:
             self.log_msg("Drive disconnected.")
-        self.refresh()
+        self.refresh(rescan=True)
 
     def _refresh_header(self):
         s = self.bridge.store.settings
@@ -404,8 +407,12 @@ class App(tk.Tk):
             name = None
         if name:
             m = mans[name]
-            who = m.get("pushed_by", {}).get("name", "?")
-            self.get_btn.set_subtitle(f"Latest: \"{name}\" from {who}, {ago(m.get('pushed_at', 0))}.")
+            by = m.get("pushed_by", {})
+            when = ago(m.get("pushed_at", 0))
+            if by.get("id") == "drive":
+                self.get_btn.set_subtitle(f"Latest: \"{name}\" ({by.get('name')}, saved {when}).")
+            else:
+                self.get_btn.set_subtitle(f"Latest: \"{name}\" from {by.get('name', '?')}, {when}.")
 
     def setup_drive(self):
         messagebox.showinfo(APP_NAME, "Choose your external drive (the top level of the drive).\n\n"
@@ -425,16 +432,16 @@ class App(tk.Tk):
                       "for Windows onto the drive too - then it's always with your projects.", parent=self)
         self._refresh_header()
         threading.Thread(target=lambda: self.bridge.publish_machine(), daemon=True).start()
-        self.refresh()
+        self.refresh(rescan=True)
 
     # ------------------------------------------------------------------ table
-    def refresh(self):
+    def refresh(self, rescan: bool = False):
         if self.busy:
             return
 
         def work():
             try:
-                rows = self.bridge.rows()
+                rows = self.bridge.rows(rescan=rescan)
             except Exception as e:  # noqa: BLE001
                 self.q.put(("log", f"Couldn't list projects: {e}"))
                 return
@@ -450,9 +457,13 @@ class App(tk.Tk):
             local = ""
             if r.local_dir:
                 local = f"saved {ago(r.local_mtime)}" if r.local_mtime else "yes"
+            by = r.sent_by
+            if r.manifest and r.manifest.get("pushed_by", {}).get("id") == "drive":
+                folder = r.manifest.get("path", "").rsplit("/", 1)[0] if "/" in r.manifest.get("path", "") else ""
+                by = f"drive: {folder or 'top level'}"
             self.tree.insert("", "end", iid=str(i), text="   " + r.name,
                              values=(f"{STATUS_ICONS[r.status]}  {STATUS_TEXT[r.status]}",
-                                     ago(r.sent_at), r.sent_by, local), tags=(r.status,))
+                                     ago(r.sent_at), by, local), tags=(r.status,))
             if r.name == sel_name:
                 self.tree.selection_set(str(i))
         if not rows:
@@ -623,7 +634,7 @@ class App(tk.Tk):
         if r.local_dir:
             pu.reveal_path(r.local_dir)
         elif self.bridge.drive:
-            pu.reveal_path(self.bridge.drive.projects_dir / r.name)
+            pu.reveal_path(self.bridge.drive.project_path(r.name, r.manifest))
 
     def open_settings(self):
         SettingsDialog(self)
