@@ -120,7 +120,7 @@ def test_finds_moved_file_by_name_and_size(tmp_path):
 def test_legacy_live10_fileref(tmp_path):
     proj = tmp_path / "Old Project"
     ext = write(tmp_path / "lib" / "hat.wav", b"H" * 9)
-    hint = [p for p in ext.parent.parts if p not in ("/",)]
+    hint = [p.rstrip("\\/") for p in ext.parent.parts if p.rstrip("\\/")]
     make_set(proj / "Old.als", [audio_track("A", legacy_fileref([], "hat.wav", has_rel=False, rpt=1, size=9,
                                                                  hint_dirs=hint))], creator="Ableton Live 10.1.30")
     res = collect_project(proj)

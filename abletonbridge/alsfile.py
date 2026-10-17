@@ -366,7 +366,8 @@ def _legacy_search_hint(elem: ET.Element, name: str) -> str:
     hint = elem.find("SearchHint/PathHint")
     if hint is None or not name:
         return ""
-    dirs = [e.get("Dir", "") for e in hint.findall("RelativePathElement")]
+    dirs = [e.get("Dir", "").rstrip("\\/") for e in hint.findall("RelativePathElement")]
+    dirs = [d for d in dirs if d]
     if not dirs:
         return ""
     if re.match(r"^[A-Za-z]:$", dirs[0]):
