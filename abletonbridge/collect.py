@@ -16,6 +16,7 @@ import hashlib
 import os
 import re
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -246,7 +247,14 @@ def collect_project(project_dir: Path, *, search_dirs: list[Path] | None = None,
         except AlsError as exc:
             result.errors.append(str(exc))
             continue
+        # A set we can't rewrite safely is still checked (missing files are reported),
+        # but nothing is copied for it and it's left exactly as it is.
+        edit = not dry_run and als.editable
+        if not dry_run and not als.editable:
+            result.errors.append(f"{set_path.name}: left unchanged (unusual file layout). If samples are "
+                                 "missing in it, open it in Live and use File > Collect All and Save.")
         changed = 0
+        failed = False
         for ref in als.filerefs():
             if ref.informational or ref.empty:
                 continue
@@ -258,29 +266,32 @@ def collect_project(project_dir: Path, *, search_dirs: list[Path] | None = None,
             if is_inside(found, project_dir):
                 rel = PurePosixPath(*found.resolve().relative_to(project_dir.resolve()).parts).as_posix()
                 if not name_is_portable(rel):
-                    if dry_run:
-                        rel = "(renamed for Windows) " + rel
-                    else:
+                    if edit:
                         rel = importer.import_file(found, ref.kind)
                         log(f"Renamed for Windows: {found.name} -> {rel}")
+                    else:
+                        rel = "(renamed for Windows) " + rel
             elif not include_core_library and is_core_library(found):
                 continue
             else:
                 result.external.add(str(found))
-                rel = importer.import_file(found, ref.kind) if not dry_run else f"(collect) {found.name}"
-                if not dry_run:
+                if edit:
+                    rel = importer.import_file(found, ref.kind)
                     log(f"Collected {found.name}")
+                else:
+                    rel = f"(collect) {found.name}"
             if ref.relative_path_type == PROJECT_RELATIVE and ref.relative_path == rel and (
                     ref.fmt == "modern" or ref.has_relative_path):
                 continue
             changed += 1
-            if not dry_run:
-                als.set_project_relative(ref, rel, project_dir / Path(*rel.split("/")))
-        if changed and not dry_run:
-            if not als.editable:
-                result.errors.append(f"{set_path.name}: couldn't be updated safely - use Live's "
-                                     "File > Collect All and Save for this set.")
-                continue
+            if edit:
+                try:
+                    als.set_project_relative(ref, rel, project_dir / Path(*rel.split("/")))
+                except (AlsError, ET.ParseError) as exc:
+                    result.errors.append(f"{set_path.name}: left unchanged ({exc}).")
+                    failed = True
+                    break
+        if changed and edit and not failed:
             backup_set(set_path)
             mtime = set_path.stat().st_mtime
             als.save()
@@ -288,5 +299,6 @@ def collect_project(project_dir: Path, *, search_dirs: list[Path] | None = None,
             # nudged forward so sync still sees the file as changed.
             os.utime(set_path, (mtime + 2, mtime + 2))
             result.sets_changed.append(set_path.name)
-        result.refs_fixed += changed
+        if not failed:
+            result.refs_fixed += changed
     return result

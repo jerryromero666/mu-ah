@@ -580,10 +580,16 @@ def pull(store: LocalStore, drive: Drive, drive_name: str, *, resolution: str | 
     # Samples that the set points to elsewhere on the drive (e.g. a sample library folder on it)
     # or that were never collected: pack them in now so the set opens complete.
     s = store.settings
-    collect = collect_project(local, search_dirs=[Path(d) for d in s.sample_search_dirs],
-                              include_core_library=s.collect_core_library, volume_roots=drive.search_roots, log=log)
-    if collect.files_copied:
-        log(f"Packed {len(collect.files_copied)} sample(s) from elsewhere on the drive into the project.")
+    try:
+        collect = collect_project(local, search_dirs=[Path(d) for d in s.sample_search_dirs],
+                                  include_core_library=s.collect_core_library, volume_roots=drive.search_roots,
+                                  log=log)
+        if collect.files_copied:
+            log(f"Packed {len(collect.files_copied)} sample(s) from elsewhere on the drive into the project.")
+        for err in collect.errors:
+            log(f"Warning: {err}")
+    except Exception as exc:  # noqa: BLE001 - the project is already copied; never fail the Get here
+        log(f"Warning: couldn't pack outside samples into the project ({exc}).")
     store.set_project_state(drive_name, local, revision, snapshot(local))
     log(f"Got \"{drive_name}\" version {revision} -> {local}")
     return PullResult(drive_name, local, _main_set_path(local, manifest), len(to_copy) - len(missing), total,

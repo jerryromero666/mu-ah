@@ -403,3 +403,46 @@ def test_get_into_existing_local_copy(tmp_path):
     res = b.get("Old Song Project", resolution="backup_and_get")
     assert res.local_dir == mine and "Old Song.als" in res.backups
     assert {r.name: r for r in b.rows()}["Old Song Project"].status == "synced"
+
+
+def test_unusual_fileref_layouts_are_edited_safely(tmp_path):
+    """Layouts that real sets contain: attributes on FileRef, empty/self-closing FileRefs, CRLF line ends."""
+    import gzip
+    proj = tmp_path / "ghost city Project"
+    ext = write(tmp_path / "lib" / "808 Hat Open 04.flac", b"H" * 12)
+    ref_with_attr = modern_fileref("", str(ext), 1, 12).replace("<FileRef>", '<FileRef Id="7">', 1)
+    tracks = [
+        audio_track("Hat", ref_with_attr),
+        audio_track("Empty", "<FileRef>\n\t\t</FileRef>"),
+        audio_track("Closed", "<FileRef />"),
+    ]
+    make_set(proj / "ghost city.als", tracks)
+    xml = read_set_xml(proj / "ghost city.als").replace("\n", "\r\n")
+    (proj / "ghost city.als").write_bytes(gzip.compress(xml.encode()))
+    before = read_set_xml(proj / "ghost city.als")
+
+    als = AbletonSet(proj / "ghost city.als")
+    assert als.editable
+    res = collect_project(proj)
+    assert res.errors == [] and res.missing == []
+    assert res.files_copied == ["Samples/Imported/808 Hat Open 04.flac"]
+    after = read_set_xml(proj / "ghost city.als")
+    assert '<FileRef Id="7">' in after and "<FileRef>\r\n\t\t</FileRef>" in after and "<FileRef />" in after
+    import re
+    strip = lambda s: re.sub(r"<FileRef[ >].*?</FileRef>", "", s, flags=re.S)  # noqa: E731
+    assert strip(before) == strip(after)
+    ref = [r for r in AbletonSet(proj / "ghost city.als").filerefs()
+           if not r.informational and not r.empty][0]
+    assert ref.relative_path == "Samples/Imported/808 Hat Open 04.flac" and ref.relative_path_type == 3
+
+
+def test_uneditable_set_never_breaks_get(tmp_path, monkeypatch):
+    mac, pc = stores(tmp_path)
+    usb, drive = existing_drive(tmp_path)
+    drive.scan_existing(force=True)
+    monkeypatch.setattr(AbletonSet, "editable", property(lambda self: False))
+    logs = []
+    res = pull(pc, drive, "Old Song Project", log=logs.append)
+    assert res.files_received > 0 and res.main_set.is_file()
+    assert any("left unchanged" in line for line in logs)
+    assert not (res.local_dir / "Samples" / "Imported").exists()  # nothing copied for a set left as-is

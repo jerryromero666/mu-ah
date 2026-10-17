@@ -34,6 +34,7 @@ import gzip
 import os
 import re
 import xml.etree.ElementTree as ET
+from xml.parsers import expat
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -43,7 +44,37 @@ PROJECT_RELATIVE = 3
 # (browser location, last preset used). Live opens the set fine without them.
 INFORMATIONAL_ANCESTORS = {"LastPresetRef", "SourceContext", "OriginalFileRef", "BrowserContentPath"}
 
-_FILEREF_RE = re.compile(r"<FileRef>(.*?)</FileRef>", re.S)
+
+
+def element_spans(data: bytes, tag: str) -> list[tuple[int, int]]:
+    """Exact byte ranges of every <tag> element, in document order (same order as ET's iter()).
+
+    Uses the XML parser's own positions, so attributes, empty elements, self-closing tags,
+    unusual whitespace and nesting are all handled.
+    """
+    parser = expat.ParserCreate()
+    spans: list[tuple[int, int] | None] = []
+    stack: list[tuple[int, int]] = []
+
+    def start(name, _attrs):
+        if name == tag:
+            stack.append((parser.CurrentByteIndex, len(spans)))
+            spans.append(None)
+
+    def end(name):
+        if name != tag:
+            return
+        s, idx = stack.pop()
+        e = parser.CurrentByteIndex
+        if data[e:e + 2] == b"</":  # <tag ...> ... </tag>: e is where the end tag starts
+            spans[idx] = (s, data.index(b">", e) + 1)
+        else:  # <tag ... />: e is just past the tag
+            spans[idx] = (s, e)
+
+    parser.StartElementHandler = start
+    parser.EndElementHandler = end
+    parser.Parse(data, True)
+    return [sp for sp in spans if sp is not None]
 
 TRACK_TAGS = {"AudioTrack", "MidiTrack", "GroupTrack", "ReturnTrack", "MasterTrack", "MainTrack", "PreHearTrack"}
 
@@ -139,6 +170,7 @@ class AbletonSet:
         except (OSError, EOFError) as exc:
             raise AlsError(f"{self.path.name} is damaged or incomplete ({exc}).") from exc
         try:
+            self.data = data
             self.text = data.decode("utf-8")
             self.root = ET.fromstring(data)
         except (UnicodeDecodeError, ET.ParseError) as exc:
@@ -147,13 +179,14 @@ class AbletonSet:
             raise AlsError(f"{self.path.name} isn't an Ableton Live Set.")
         self._parents = {child: parent for parent in self.root.iter() for child in parent}
         self._pending: dict[int, ET.Element] = {}
-        self._fileref_elems = [e for e in self.root.iter("FileRef") if len(e)]
-        self._matches = list(_FILEREF_RE.finditer(self.text))
-        if len(self._matches) != len(self._fileref_elems):
-            # Should never happen with files Live writes; refuse to edit rather than guess.
-            self._editable = False
-        else:
-            self._editable = True
+        self._fileref_elems = list(self.root.iter("FileRef"))
+        try:
+            self._spans = element_spans(data, "FileRef")
+        except (expat.ExpatError, ValueError):
+            self._spans = []
+        # Refuse to edit rather than guess if the two views of the file ever disagree.
+        self._editable = len(self._spans) == len(self._fileref_elems) and all(
+            data[s:s + 8] == b"<FileRef" for s, _ in self._spans)
 
     # ------------------------------------------------------------------ info
     @property
@@ -235,8 +268,12 @@ class AbletonSet:
         """Point *ref* at ``project/rel_posix`` (also storing the new absolute path)."""
         if not self._editable:
             raise AlsError(f"{self.path.name}: unexpected file structure, not modifying it.")
-        m = self._matches[ref.index]
-        block = ET.fromstring(m.group(0))
+        s, e = self._spans[ref.index]
+        for i in self._pending:
+            ps, pe = self._spans[i]
+            if i != ref.index and s < pe and ps < e:
+                raise AlsError(f"{self.path.name}: nested file reference, not modifying it.")
+        block = ET.fromstring(self.data[s:e])
         abs_str = str(abs_path).replace("\\", "/")
         if ref.fmt == "modern":
             _set_child_value(block, "RelativePathType", str(PROJECT_RELATIVE))
@@ -263,21 +300,24 @@ class AbletonSet:
     def has_changes(self) -> bool:
         return bool(self._pending)
 
-    def render(self) -> str:
+    def render_bytes(self) -> bytes:
         if not self._pending:
-            return self.text
+            return self.data
         pieces, pos = [], 0
-        for i, m in enumerate(self._matches):
-            if i in self._pending:
-                pieces.append(self.text[pos:m.start()])
-                pieces.append(ET.tostring(self._pending[i], encoding="unicode"))
-                pos = m.end()
-        pieces.append(self.text[pos:])
-        return "".join(pieces)
+        for i in sorted(self._pending, key=lambda i: self._spans[i][0]):
+            s, e = self._spans[i]
+            pieces.append(self.data[pos:s])
+            pieces.append(ET.tostring(self._pending[i], encoding="unicode").encode("utf-8"))
+            pos = e
+        pieces.append(self.data[pos:])
+        return b"".join(pieces)
+
+    def render(self) -> str:
+        return self.render_bytes().decode("utf-8")
 
     def save(self, path: Path | None = None) -> None:
         target = Path(path or self.path)
-        data = self.render().encode("utf-8")
+        data = self.render_bytes()
         if self.gzipped:
             data = gzip.compress(data, compresslevel=6)
         tmp = target.with_name(target.name + ".abtmp")
