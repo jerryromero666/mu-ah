@@ -461,14 +461,24 @@ def _song(folder, tag, sample=b"S"):
                     [audio_track(tag, modern_fileref("Samples/Recorded/Audio 1.wav", "/x", 3, len(sample) * 10))])
 
 
-def _exfat(monkeypatch):
-    """Make drive writes behave like exFAT: names with  " * : < > ? \\ |  are refused."""
+# Names like "What If?" or "Take: 1.wav" can only exist on a Mac (or Linux); Windows can't create them.
+MAC_ONLY_NAMES = pytest.mark.skipif(os.name == "nt", reason="file names with ? or : can't exist on Windows")
+
+
+def _exfat(monkeypatch, drive_root):
+    """Make writes onto the drive behave like exFAT: names with  " * : < > ? |  are refused.
+
+    Only the part of the path inside the drive is checked ("C:" at the start of a Windows path is fine).
+    """
     import abletonbridge.platform_utils as pu
     real = pu.copy_file
 
     def copy(src, dst, *a, **k):
-        if any(c in Path(dst).name for c in '"*:<>?\\|') or any(c in str(dst) for c in ':?*"<>|'
-                                                                 if "USB" in str(dst)):
+        try:
+            inside = Path(dst).relative_to(drive_root).parts
+        except ValueError:
+            inside = ()
+        if any(c in part for part in inside for c in '"*:<>?|'):
             raise OSError(22, "Invalid argument")
         return real(src, dst, *a, **k)
     monkeypatch.setattr(pu, "copy_file", copy)
@@ -595,8 +605,9 @@ def test_interrupted_send_answer_doesnt_skip_other_questions(tmp_path, song):
     assert next(local.glob("Backup/Before get */Samples/Recorded/Vox.wav")).read_bytes() == b"EDITED" * 30
 
 
+@MAC_ONLY_NAMES
 def test_names_the_drive_cant_store_dont_block_send(tmp_path, monkeypatch):
-    _exfat(monkeypatch)
+    _exfat(monkeypatch, tmp_path / "USB")
     mac, pc = stores(tmp_path)
     drive = Drive.initialize(tmp_path / "USB")
     proj = tmp_path / "Music" / "What If? Project"
@@ -669,18 +680,20 @@ def test_names_with_dots_are_not_mangled():
 
 def test_renamed_files_resolve_on_the_other_computer(tmp_path, monkeypatch):
     """Every file the app renames is renamed in the set too, so Live finds it on the other computer."""
-    _exfat(monkeypatch)
+    _exfat(monkeypatch, tmp_path / "USB")
     mac, pc = stores(tmp_path)
     drive = Drive.initialize(tmp_path / "USB")
     proj = tmp_path / "Music" / "Kicks Project"
     k1 = write(tmp_path / "Splice" / "A" / "kick.wav", b"KICK-ONE" * 5)
     k2 = write(tmp_path / "Splice" / "B" / "kick.wav", b"KICK-TWO" * 7)
-    k3 = write(proj / "Samples" / "Recorded" / "Take: 1.wav", b"TAKE" * 3)
-    make_set(proj / "Kicks.als", [
-        audio_track("K1", modern_fileref("", str(k1), 1, 40)),
-        audio_track("K2", modern_fileref("", str(k2), 1, 56)),
-        audio_track("Take", modern_fileref("Samples/Recorded/Take: 1.wav", str(k3), 3, 12)),
-    ])
+    tracks = [audio_track("K1", modern_fileref("", str(k1), 1, 40)),
+              audio_track("K2", modern_fileref("", str(k2), 1, 56))]
+    expected = [b"KICK-ONE" * 5, b"KICK-TWO" * 7]
+    if os.name != "nt":  # a Mac-only name, renamed for the drive
+        k3 = write(proj / "Samples" / "Recorded" / "Take: 1.wav", b"TAKE" * 3)
+        tracks.append(audio_track("Take", modern_fileref("Samples/Recorded/Take: 1.wav", str(k3), 3, 12)))
+        expected.append(b"TAKE" * 3)
+    make_set(proj / "Kicks.als", tracks)
     res = push(mac, drive, proj)
     assert res.warnings == []
     got = pull(pc, drive, "Kicks Project").local_dir
@@ -691,11 +704,12 @@ def test_renamed_files_resolve_on_the_other_computer(tmp_path, monkeypatch):
     for rel in refs:
         assert (got / rel).is_file(), f"Live would show {rel} as missing"
         played[rel] = (got / rel).read_bytes()
-    assert sorted(played.values()) == sorted([b"KICK-ONE" * 5, b"KICK-TWO" * 7, b"TAKE" * 3])
+    assert sorted(played.values()) == sorted(expected)
 
 
+@MAC_ONLY_NAMES
 def test_warns_when_a_used_file_cant_be_renamed_in_the_set(tmp_path, monkeypatch):
-    _exfat(monkeypatch)
+    _exfat(monkeypatch, tmp_path / "USB")
     mac, pc = stores(tmp_path)
     drive = Drive.initialize(tmp_path / "USB")
     proj = tmp_path / "Music" / "Stuck Project"
