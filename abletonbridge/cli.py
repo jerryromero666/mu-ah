@@ -100,6 +100,8 @@ def main(argv=None) -> int:
             res = _with_conflicts(lambda r: bridge.send(proj, resolution=r, progress=_progress_bar, log=print),
                                   args.resolve)
             if res:
+                for w in res.warnings:
+                    print(f"  ! {w}")
                 others = [m for m in res.report.machines if m.id != bridge.store.settings.machine_id]
                 for m in others:
                     for line in res.report.problems_for(m.id):

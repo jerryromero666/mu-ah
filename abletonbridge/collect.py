@@ -32,7 +32,8 @@ IMPORT_DIRS = {"sample": "Samples/Imported", "max": "Presets/Imported"}
 def safe_filename(name: str, max_len: int = 120) -> str:
     """A filename that works on Windows, macOS and exFAT drives."""
     stem, dot, ext = name.rpartition(".")
-    if not dot:
+    # Only a real extension counts ("Kick.wav"); "Mr. Brightside Project" has none.
+    if not dot or not stem or not re.fullmatch(r"[A-Za-z0-9]{1,10}", ext):
         stem, ext = name, ""
     stem = WIN_ILLEGAL.sub("_", stem).rstrip(" .") or "file"
     ext = WIN_ILLEGAL.sub("_", ext).strip(" .")

@@ -557,7 +557,7 @@ def test_saved_on_the_drive_then_send_or_get_right_away(tmp_path, song):
     mac, pc = stores(tmp_path)
     drive = Drive.initialize(tmp_path / "USB")
     push(mac, drive, song)
-    pc_local = pull(pc, drive, "Song Project").local_dir
+    pull(pc, drive, "Song Project")
     on_drive = drive.projects_dir / "Song Project" / "Song.als"
     make_set(on_drive, [midi_track("SAVED-ON-DRIVE", "")])
     _bump(on_drive, 600)
@@ -656,3 +656,51 @@ def test_projects_synced_by_the_older_version_keep_working(tmp_path, song):
     r = push(pc, drive, local)                                         # PC: no "different project" question
     assert r.revision == 2
     assert json.loads(local.joinpath(*ID_FILE).read_text())["id"] == drive.manifest("Song Project")["id"]
+
+
+def test_names_with_dots_are_not_mangled():
+    assert safe_filename("Mr. Brightside Project") == "Mr. Brightside Project"
+    assert safe_filename("Vol. 2 Kick.wav") == "Vol. 2 Kick.wav"
+    assert safe_filename("Vox feat. J.") == "Vox feat. J"
+    assert safe_filename("Kick: Hard.wav") == "Kick_ Hard.wav"
+    from abletonbridge.collect import name_is_portable
+    assert name_is_portable("Samples/Vol. 2 Pack/Kick.wav")
+
+
+def test_renamed_files_resolve_on_the_other_computer(tmp_path, monkeypatch):
+    """Every file the app renames is renamed in the set too, so Live finds it on the other computer."""
+    _exfat(monkeypatch)
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    proj = tmp_path / "Music" / "Kicks Project"
+    k1 = write(tmp_path / "Splice" / "A" / "kick.wav", b"KICK-ONE" * 5)
+    k2 = write(tmp_path / "Splice" / "B" / "kick.wav", b"KICK-TWO" * 7)
+    k3 = write(proj / "Samples" / "Recorded" / "Take: 1.wav", b"TAKE" * 3)
+    make_set(proj / "Kicks.als", [
+        audio_track("K1", modern_fileref("", str(k1), 1, 40)),
+        audio_track("K2", modern_fileref("", str(k2), 1, 56)),
+        audio_track("Take", modern_fileref("Samples/Recorded/Take: 1.wav", str(k3), 3, 12)),
+    ])
+    res = push(mac, drive, proj)
+    assert res.warnings == []
+    got = pull(pc, drive, "Kicks Project").local_dir
+    import shutil
+    shutil.rmtree(tmp_path / "Splice")
+    refs = {r.relative_path: r for r in AbletonSet(got / "Kicks.als").filerefs() if not r.informational}
+    played = {}
+    for rel in refs:
+        assert (got / rel).is_file(), f"Live would show {rel} as missing"
+        played[rel] = (got / rel).read_bytes()
+    assert sorted(played.values()) == sorted([b"KICK-ONE" * 5, b"KICK-TWO" * 7, b"TAKE" * 3])
+
+
+def test_warns_when_a_used_file_cant_be_renamed_in_the_set(tmp_path, monkeypatch):
+    _exfat(monkeypatch)
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    proj = tmp_path / "Music" / "Stuck Project"
+    write(proj / "Samples" / "Recorded" / "Take: 1.wav", b"TAKE" * 3)
+    make_set(proj / "Stuck.als", [audio_track("T", modern_fileref("Samples/Recorded/Take: 1.wav", "/x", 3, 12))])
+    monkeypatch.setattr(AbletonSet, "editable", property(lambda self: False))
+    res = push(mac, drive, proj)
+    assert len(res.warnings) == 1 and "Collect All and Save" in res.warnings[0]

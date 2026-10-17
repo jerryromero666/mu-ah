@@ -30,11 +30,11 @@ import time
 import unicodedata
 import uuid
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from . import platform_utils as pu
-from .alsfile import find_sets
-from .collect import CollectResult, collect_project, file_sha1, name_is_portable, safe_filename
+from .alsfile import AbletonSet, AlsError, find_sets
+from .collect import CollectResult, collect_project, file_sha1, is_inside, name_is_portable, safe_filename
 from .config import LocalStore, _atomic_write_json, read_json
 
 MTIME_TOLERANCE = 2.1  # FAT/exFAT timestamps are coarse
@@ -141,6 +141,33 @@ def drive_names(project_dir: Path, snap: dict[str, list], log=None) -> dict[str,
         mapping[rel] = cand
         log(f"\"{rel}\" is stored on the drive as \"{cand}\" (its name doesn't work on Windows).")
     return mapping
+
+
+def _renamed_but_still_used(project_dir: Path, sets: list[Path], names: dict[str, str]) -> list[str]:
+    """Files a set still points at under a name the drive can't store.
+
+    Normally the sets were already updated to use a Windows-safe copy (collect_project). This only
+    happens when a set couldn't be updated - then the file would show as missing in Live on the
+    other computer, so say so plainly.
+    """
+    out: list[str] = []
+    for sp in sets:
+        try:
+            als = AbletonSet(sp)
+        except AlsError:
+            continue
+        for ref in als.filerefs():
+            if ref.informational or ref.empty:
+                continue
+            found = next((c for c in ref.candidates(project_dir) if c.is_file()), None)
+            if found is None or not is_inside(found, project_dir):
+                continue
+            rel = PurePosixPath(*found.resolve().relative_to(project_dir.resolve()).parts).as_posix()
+            if names.get(rel) != rel:
+                out.append(f"\"{sp.name}\" uses \"{rel}\", a name Windows can't store, and the set couldn't be "
+                           "updated automatically. On the other computer Live will show it as missing. Fix: open "
+                           "the set in Live, File > Collect All and Save, then send again.")
+    return out
 
 
 def _same_bytes(project_dir: Path, a: str, b: str) -> bool:
@@ -464,6 +491,7 @@ class PushResult:
     bytes_sent: int
     collect: CollectResult
     report: object = None
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -570,6 +598,9 @@ def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution=None,
 
     snap = snapshot(project_dir)
     names = drive_names(project_dir, snap, log=log)
+    warnings = _renamed_but_still_used(project_dir, sets, names)
+    for w in warnings:
+        log(f"Warning: {w}")
     dsnap = {names[r]: snap[r] for r in names}
     main_d = names.get(main, safe_filename(main, max_len=255))
     dest = drive.project_path(drive_name, manifest)
@@ -598,7 +629,7 @@ def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution=None,
             drive.write_manifest(drive_name, manifest)
         store.set_project_state(drive_name, project_dir, revision, snap, pid)
         log(f"\"{drive_name}\" on the drive is already up to date.")
-        return PushResult(drive_name, revision, main_d, 0, 0, collect)
+        return PushResult(drive_name, revision, main_d, 0, 0, collect, warnings=warnings)
 
     free = pu.free_space(drive.root)
     if 0 <= free < total + 50 * 1024 * 1024:
@@ -645,7 +676,7 @@ def push(store: LocalStore, drive: Drive, project_dir: Path, *, resolution=None,
                 store.forget_project(name)
     store.set_project_state(drive_name, project_dir, revision, snap, pid)
     log(f"Sent \"{drive_name}\" to the drive (version {revision}).")
-    return PushResult(drive_name, revision, main_d, len(to_copy), total, collect)
+    return PushResult(drive_name, revision, main_d, len(to_copy), total, collect, warnings=warnings)
 
 
 # --------------------------------------------------------------------------- pull

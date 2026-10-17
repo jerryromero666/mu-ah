@@ -539,6 +539,7 @@ class App(tk.Tk):
             problems += [f"{m.name}: {p}" for p in rep.problems_for(m.id)]
             warns += [f"{m.name}: {w}" for w in rep.warnings_for(m.id)]
         local_missing = [f"Missing file: {mf.filename} (not on this computer either)" for mf in rep.missing_files]
+        local_missing += result.warnings
         collected = len(result.collect.files_copied)
         if result.files_sent:
             msg = f"✓ Sent \"{result.drive_name}\" ({result.bytes_sent / 1e6:.1f} MB"
@@ -549,7 +550,7 @@ class App(tk.Tk):
             msg = f"✓ \"{result.drive_name}\" was already up to date on the drive."
         if not others:
             msg += " Open Ableton Bridge on your other computer once so it can check plugins."
-        self.status_lbl.configure(text=msg, fg=GREEN if not problems else YELLOW)
+        self.status_lbl.configure(text=msg, fg=GREEN if not (problems or local_missing) else YELLOW)
         self._append_log(msg)
         self.refresh()
         if problems or local_missing:
