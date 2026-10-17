@@ -214,7 +214,8 @@ class App(tk.Tk):
         self.act_open = ttk.Button(actions, text="Open here", command=self.action_open_selected)
         self.act_check = ttk.Button(actions, text="Check project", command=self.action_check_selected)
         self.act_show = ttk.Button(actions, text="Show in folder", command=self.action_show_selected)
-        for b in (self.act_send, self.act_get, self.act_open, self.act_check, self.act_show):
+        self.act_versions = ttk.Button(actions, text="Versions", command=self.action_versions)
+        for b in (self.act_send, self.act_get, self.act_open, self.act_versions, self.act_check, self.act_show):
             b.pack(side="left", padx=(0, 8))
 
         # footer
@@ -314,8 +315,14 @@ class App(tk.Tk):
         if conflict:
             self.progress["value"] = 0
             self.status_lbl.configure(text=conflict.title, fg=YELLOW)
-            choice = ChoiceDialog(self, conflict.title, conflict.message, conflict.options).result
-            if choice and retry:
+            choice = ChoiceDialog(self, conflict.title, conflict.message, conflict.options,
+                                  conflict.versions, conflict.kind).result
+            proj = conflict.project
+            if choice == "use_theirs" and proj.get("name"):
+                self._get(proj["name"], ("backup_and_get",))      # mine goes to Backup on this computer
+            elif choice == "use_mine" and proj.get("local_dir"):
+                self._send(Path(proj["local_dir"]), ("overwrite",))  # the drive's goes to Backup on the drive
+            elif choice and retry:
                 retry(choice)
             else:
                 self.status_lbl.configure(text="Cancelled - nothing was changed.", fg=MUTED)
@@ -491,6 +498,7 @@ class App(tk.Tk):
         en(self.act_open, bool(r and r.local_dir))
         en(self.act_check, bool(r and r.local_dir))
         en(self.act_show, bool(r and (r.local_dir or (r.manifest and has_drive))))
+        en(self.act_versions, bool(r and r.local_dir))
 
     # ------------------------------------------------------------------ actions
     def action_primary(self):
@@ -591,7 +599,7 @@ class App(tk.Tk):
         else:
             msg = f"✓ Got \"{result.drive_name}\" ({result.bytes_received / 1e6:.1f} MB)."
         if result.backups:
-            msg += " Your previous version is in Backup/."
+            msg += " Your previous version is kept - see Versions."
         self.status_lbl.configure(text=msg, fg=GREEN if not problems else YELLOW)
         self._append_log(msg)
         self.refresh()
@@ -637,6 +645,11 @@ class App(tk.Tk):
         elif self.bridge.drive:
             pu.reveal_path(self.bridge.drive.project_path(r.name, r.manifest))
 
+    def action_versions(self):
+        r = self.selected()
+        if r and r.local_dir:
+            VersionsWindow(self, r)
+
     def open_settings(self):
         SettingsDialog(self)
 
@@ -664,18 +677,53 @@ class _Dialog(tk.Toplevel):
         self.wait_window()
 
 
+def when_text(ts: float) -> str:
+    if not ts:
+        return "unknown time"
+    return f"{time.strftime('%a %b %d, %H:%M', time.localtime(ts))}  ({ago(ts)})"
+
+
 class ChoiceDialog(_Dialog):
-    def __init__(self, master, title, message, options: dict[str, str]):
-        super().__init__(master, title)
+    def __init__(self, master, title, message, options: dict[str, str], versions: list[dict] | None = None,
+                 kind: str = ""):
+        super().__init__(master, title, width=640)
         tk.Label(self, text=title, bg=PANEL, fg=TEXT, font=(FAMILY, 15, "bold"), anchor="w").pack(fill="x")
-        tk.Label(self, text=message, bg=PANEL, fg=MUTED, font=(FAMILY, 11), wraplength=520, justify="left",
-                 anchor="w").pack(fill="x", pady=(8, 16))
+        tk.Label(self, text=message, bg=PANEL, fg=MUTED, font=(FAMILY, 11), wraplength=600, justify="left",
+                 anchor="w").pack(fill="x", pady=(8, 14))
+        if versions:
+            cards = tk.Frame(self, bg=PANEL)
+            cards.pack(fill="x", pady=(0, 16))
+            newest = max(v.get("when", 0) for v in versions)
+            for i, v in enumerate(versions):
+                cards.columnconfigure(i, weight=1, uniform="v")
+                card = tk.Frame(cards, bg=BG, padx=14, pady=12)
+                card.grid(row=0, column=i, sticky="nsew", padx=(0 if i == 0 else 6, 0 if i else 6))
+                tk.Label(card, text=v["label"].upper(), bg=BG, fg=MUTED, font=(FAMILY, 9, "bold"),
+                         anchor="w").pack(fill="x")
+                tk.Label(card, text=f"Last saved on {v['computer']}", bg=BG, fg=TEXT, font=(FAMILY, 12, "bold"),
+                         anchor="w", justify="left", wraplength=270).pack(fill="x", pady=(4, 0))
+                tk.Label(card, text=when_text(v.get("when", 0)), bg=BG, fg=TEXT, font=(FAMILY, 11),
+                         anchor="w").pack(fill="x")
+                if v.get("set"):
+                    tk.Label(card, text=v["set"], bg=BG, fg=MUTED, font=(FAMILY, 10), anchor="w").pack(fill="x")
+                if v.get("when", 0) == newest and len(versions) > 1:
+                    tk.Label(card, text="NEWER", bg=BG, fg=GREEN, font=(FAMILY, 9, "bold"),
+                             anchor="w").pack(fill="x", pady=(4, 0))
+        # Highlight the newer version when it's the same song changed in two places; otherwise the first option.
+        default = next(iter(options))
+        if kind in ("drive_newer", "both_changed") and versions and len(versions) == 2:
+            mine_newer = versions[0].get("when", 0) >= versions[1].get("when", 0)
+            wanted = {"overwrite", "use_mine"} if mine_newer else {"use_theirs", "backup_and_get"}
+            default = next((k for k in options if k in wanted), default)
         row = tk.Frame(self, bg=PANEL)
         row.pack(fill="x")
         ttk.Button(row, text="Cancel", command=self.destroy).pack(side="right")
-        for i, (key, label) in enumerate(options.items()):
-            ttk.Button(row, text=label, style="Accent.TButton" if i == 0 else "TButton",
+        for key, label in reversed(list(options.items())):
+            ttk.Button(row, text=label, style="Accent.TButton" if key == default else "TButton",
                        command=lambda k=key: self._pick(k)).pack(side="right", padx=(0, 8))
+        if versions:
+            tk.Label(self, text="Nothing is deleted: the version you don't pick is kept and listed under Versions.",
+                     bg=PANEL, fg=MUTED, font=(FAMILY, 10), anchor="w").pack(fill="x", pady=(10, 0))
         self._show()
 
     def _pick(self, key):
@@ -794,6 +842,78 @@ class ReportWindow(tk.Toplevel):
         text.configure(state="disabled")
         text.pack(fill="x", pady=(12, 0))
         ttk.Button(self, text="Close", command=self.destroy).pack(anchor="e", pady=(12, 0))
+
+
+class VersionsWindow(tk.Toplevel):
+    """Every saved version of a project - which computer saved it, when - and open any of them."""
+
+    def __init__(self, app: App, row):
+        super().__init__(app)
+        from .versions import list_versions
+        self.app, self.row = app, row
+        self.title(f"Versions: {row.label or row.name}")
+        self.configure(bg=PANEL, padx=20, pady=16)
+        self.geometry("1000x520")
+        self.minsize(760, 360)
+        tk.Label(self, text=f"Versions of {row.label or row.name}", bg=PANEL, fg=TEXT, font=(FAMILY, 15, "bold"),
+                 anchor="w").pack(fill="x")
+        tk.Label(self, text="Newest first. Opening a version makes a copy next to your current set - "
+                            "nothing is overwritten.", bg=PANEL, fg=MUTED, font=(FAMILY, 10), anchor="w").pack(
+            fill="x", pady=(2, 10))
+        self.versions = list_versions(app.bridge.store, app.bridge.drive, row.name, row.local_dir)
+        row_ = tk.Frame(self, bg=PANEL)
+        row_.pack(fill="x", pady=(12, 0), side="bottom")
+        cols = ("computer", "when", "kind")
+        tree = ttk.Treeview(self, columns=cols, show="tree headings", selectmode="browse")
+        tree.heading("#0", text="SET", anchor="w")
+        tree.heading("computer", text="LAST SAVED ON", anchor="w")
+        tree.heading("when", text="WHEN", anchor="w")
+        tree.heading("kind", text="WHAT", anchor="w")
+        tree.column("#0", width=300, minwidth=160)
+        tree.column("computer", width=230, minwidth=120)
+        tree.column("when", width=170, minwidth=120)
+        tree.column("kind", width=240, minwidth=150)
+        tree.tag_configure("current", foreground=GREEN)
+        tree.tag_configure("drive_newer", foreground=BLUE)
+        for i, v in enumerate(self.versions):
+            where = "  (on the drive)" if v.on_drive else ""
+            tree.insert("", "end", iid=str(i), text="   " + v.name, tags=(v.kind,),
+                        values=(v.computer, time.strftime("%a %b %d, %H:%M", time.localtime(v.when)),
+                                v.kind_label + where))
+        if not self.versions:
+            tree.insert("", "end", iid="none", text="   No versions yet")
+        tree.pack(fill="both", expand=True)
+        tree.bind("<Double-1>", lambda e: self._open())
+        self.tree = tree
+        ttk.Button(row_, text="Close", command=self.destroy).pack(side="right")
+        ttk.Button(row_, text="Open in Live", style="Accent.TButton", command=self._open).pack(side="right",
+                                                                                            padx=(0, 8))
+        ttk.Button(row_, text="Show in folder", command=self._show_folder).pack(side="left")
+
+    def _selected(self):
+        sel = self.tree.selection()
+        if not sel or sel[0] == "none":
+            return None
+        return self.versions[int(sel[0])]
+
+    def _open(self):
+        from .versions import open_version
+        v = self._selected()
+        if not v:
+            return
+        try:
+            path = open_version(v, self.row.local_dir, log=self.app.log_msg)
+        except (OSError, ValueError) as e:
+            messagebox.showerror(APP_NAME, f"Couldn't open that version: {e}", parent=self)
+            return
+        self.app.bridge.open_set(path)
+        self.destroy()
+        self.app.refresh()
+
+    def _show_folder(self):
+        v = self._selected()
+        if v:
+            pu.reveal_path(v.set_path)
 
 
 class FolderList(tk.Frame):

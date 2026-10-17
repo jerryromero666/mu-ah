@@ -85,7 +85,7 @@ class LocalStore:
         return self.state["projects"].get(drive_name)
 
     def set_project_state(self, drive_name: str, local_path: Path, revision: int, files: dict,
-                          project_id: str | None = None) -> None:
+                          project_id: str | None = None, origins: dict | None = None) -> None:
         # One local folder is linked to at most one drive project.
         target = os.path.normcase(str(Path(local_path)))
         for name in [n for n, st in self.state["projects"].items()
@@ -96,6 +96,7 @@ class LocalStore:
             "revision": revision,
             "files": files,
             "project_id": project_id,
+            "origins": origins or {},  # file -> name of the computer that last saved it
         }
         self.save_state()
 

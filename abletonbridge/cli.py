@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 from . import __version__
@@ -23,6 +24,11 @@ def _progress_bar(frac: float) -> None:
 
 def _ask(conflict: Conflict) -> str | None:
     print(f"\n{conflict.title}\n{conflict.message}\n")
+    for v in conflict.versions:
+        when = time.strftime("%a %b %d, %H:%M", time.localtime(v["when"])) if v.get("when") else "?"
+        print(f"  {v['label']}: last saved on {v['computer']}, {when}")
+    if conflict.versions:
+        print()
     keys = list(conflict.options)
     for i, k in enumerate(keys, 1):
         print(f"  {i}) {conflict.options[k]}")
@@ -36,7 +42,7 @@ def _ask(conflict: Conflict) -> str | None:
     return None
 
 
-def _with_conflicts(fn, resolution):
+def _with_conflicts(fn, resolution, bridge=None):
     answers = [resolution] if resolution else []
     while True:
         try:
@@ -48,6 +54,12 @@ def _with_conflicts(fn, resolution):
             if not choice:
                 print("Cancelled - nothing was changed.")
                 return None
+            if bridge and choice == "use_theirs":
+                return bridge.get(c.project["name"], resolution=("backup_and_get",), progress=_progress_bar,
+                                  log=print)
+            if bridge and choice == "use_mine":
+                return bridge.send(Path(c.project["local_dir"]), resolution=("overwrite",),
+                                   progress=_progress_bar, log=print)
             answers.append(choice)
 
 
@@ -65,6 +77,8 @@ def main(argv=None) -> int:
     p.add_argument("name", nargs="?")
     p.add_argument("--open", action="store_true", help="open it in Ableton Live afterwards")
     p.add_argument("--resolve", choices=["backup_and_get", "keep_both", "continue"])
+    p = sub.add_parser("versions", help="list every saved version of a project and which computer saved it")
+    p.add_argument("project", help="project folder")
     p = sub.add_parser("check", help="health check: missing files, plugins on each computer")
     p.add_argument("project")
     p = sub.add_parser("collect", help="pack every outside file into the project (like Live's Collect All)")
@@ -98,9 +112,9 @@ def main(argv=None) -> int:
             if not proj:
                 raise BridgeError("No project found.")
             res = _with_conflicts(lambda r: bridge.send(proj, resolution=r, progress=_progress_bar, log=print),
-                                  args.resolve)
+                                  args.resolve, bridge)
             if res:
-                for w in res.warnings:
+                for w in getattr(res, "warnings", []):
                     print(f"  ! {w}")
                 others = [m for m in res.report.machines if m.id != bridge.store.settings.machine_id]
                 for m in others:
@@ -111,12 +125,19 @@ def main(argv=None) -> int:
             if not name:
                 raise BridgeError("Nothing on the drive.")
             res = _with_conflicts(lambda r: bridge.get(name, resolution=r, progress=_progress_bar, log=print),
-                                  args.resolve)
+                                  args.resolve, bridge)
             if res:
                 for line in res.report.problems_for(bridge.store.settings.machine_id):
                     print(f"  ! {line}")
-                if args.open and res.main_set:
+                if args.open and isinstance(res.main_set, Path):
                     pu.open_path(res.main_set)
+        elif args.cmd == "versions":
+            from .versions import list_versions
+            folder = Path(args.project).expanduser().resolve()
+            name = bridge.store.drive_name_for_local(folder) or folder.name
+            for v in list_versions(bridge.store, bridge.drive, name, folder):
+                when = time.strftime("%a %b %d, %H:%M", time.localtime(v.when))
+                print(f"  {when}  {v.computer:<32} {v.kind_label:<42} {v.set_path}")
         elif args.cmd == "check":
             print(bridge.check(Path(args.project).expanduser().resolve()).as_text())
         elif args.cmd == "collect":

@@ -107,6 +107,20 @@ Keep each song in its own folder. Loose `.als` files at the very top of the driv
   only differ in capital letters or accents can't both exist on the drive; the app tells you which.
 - **Moving or renaming a project folder** on your computer keeps it linked.
 
+## Versions: which computer saved what
+
+- **Changed on both computers?** You get one pop-up showing both versions side by side, with
+  *Last saved on Studio-Mac, Sat Oct 17, 20:40* and *Last saved on Studio-PC (this computer), 19:51*.
+  The newer one is marked. Pick **Use mine**, **Use the drive's** or **Keep both**. The one you don't
+  pick is never deleted.
+- **Versions button.** Select a project and click **Versions** to see every saved version: the
+  current set, Live's own backups, and the versions kept when you chose one over the other (on this
+  computer and on the drive). Each one shows which computer last saved it and when. **Open in Live**
+  opens any of them as a copy next to your current set, so nothing is overwritten. If that version
+  used different sounds, it opens as a separate copy of the whole project, so it sounds exactly as
+  it did.
+- Command line: `python AbletonBridge.py versions "<project folder>"`.
+
 ## Day to day
 
 - On the computer you worked on: save in Live (or let the app do it) and click **↑ Send to Drive**.

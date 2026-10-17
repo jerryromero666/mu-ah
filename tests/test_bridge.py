@@ -704,3 +704,94 @@ def test_warns_when_a_used_file_cant_be_renamed_in_the_set(tmp_path, monkeypatch
     monkeypatch.setattr(AbletonSet, "editable", property(lambda self: False))
     res = push(mac, drive, proj)
     assert len(res.warnings) == 1 and "Collect All and Save" in res.warnings[0]
+
+
+# ----------------------------------------------------------------------------- versions / who saved it
+
+def _both_edited(tmp_path, song):
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    write(song / "Backup" / "Song [2026-10-16 221503].als", b"live backup made on the mac")
+    push(mac, drive, song)
+    local = pull(pc, drive, "Song Project").local_dir
+    make_set(local / "Song.als", [midi_track("PC-EDIT", "")])            # PC works on it...
+    write(local / "Samples" / "Recorded" / "Vox.wav", b"PC VOX" * 40)
+    _bump(local / "Song.als", 100)
+    make_set(song / "Song.als", [midi_track("MAC-EDIT", "")])            # ...and so does the Mac
+    _bump(song / "Song.als", 200)
+    push(mac, drive, song)
+    return mac, pc, drive, local
+
+
+def test_question_says_which_computer_saved_each_version(tmp_path, song):
+    mac, pc, drive, local = _both_edited(tmp_path, song)
+    with pytest.raises(Conflict) as exc:
+        pull(pc, drive, "Song Project")
+    c = exc.value
+    assert set(c.options) == {"use_mine", "backup_and_get", "keep_both"}
+    mine, theirs = c.versions
+    assert mine["computer"] == "Studio-PC (this computer)" and theirs["computer"] == "Studio-Mac"
+    assert mine["when"] and theirs["when"] and c.project["local_dir"] == str(local)
+    # an answer meant for the other action is ignored, never treated as "go ahead"
+    with pytest.raises(Conflict):
+        pull(pc, drive, "Song Project", resolution=("use_mine",))
+    with pytest.raises(Conflict):
+        pull(pc, drive, "Song Project", resolution="overwrite")
+    local_set = (local / "Song.als").read_bytes()
+    _bump(local / "Song.als", 5)
+    with pytest.raises(Conflict):
+        push(pc, drive, local, resolution=("use_theirs",))
+    assert (local / "Song.als").read_bytes() == local_set
+
+
+def test_use_the_drives_version_keeps_mine_in_versions(tmp_path, song):
+    from abletonbridge.versions import list_versions, open_version
+    mac, pc, drive, local = _both_edited(tmp_path, song)
+    pull(pc, drive, "Song Project", resolution=("backup_and_get",))
+    vs = list_versions(pc, drive, "Song Project", local)
+    current = next(v for v in vs if v.kind == "current")
+    kept = next(v for v in vs if v.kind == "before_get")
+    live = next(v for v in vs if v.kind == "live_backup")
+    assert current.computer == "Studio-Mac" and "MAC-EDIT" in read_set_xml(current.set_path)
+    assert kept.computer == "Studio-PC (this computer)" and "PC-EDIT" in read_set_xml(kept.set_path)
+    assert live.computer == "Studio-Mac"                                  # Live's own backup, made on the Mac
+    # opening my old version never overwrites anything; it changed a sound, so it opens as its own copy
+    opened = open_version(kept, local)
+    assert opened.parent != local and "PC-EDIT" in read_set_xml(opened)
+    assert (opened.parent / "Samples" / "Recorded" / "Vox.wav").read_bytes() == b"PC VOX" * 40
+    assert "MAC-EDIT" in read_set_xml(local / "Song.als")
+    assert (local / "Samples" / "Recorded" / "Vox.wav").read_bytes() != b"PC VOX" * 40
+
+
+def test_use_mine_keeps_the_drives_version_on_the_drive(tmp_path, song):
+    from abletonbridge.versions import list_versions
+    mac, pc, drive, local = _both_edited(tmp_path, song)
+    with pytest.raises(Conflict) as exc:
+        push(pc, drive, local)
+    assert set(exc.value.options) == {"overwrite", "use_theirs", "keep_both"}
+    assert exc.value.versions[1]["computer"] == "Studio-Mac"
+    push(pc, drive, local, resolution=("overwrite",))
+    vs = list_versions(pc, drive, "Song Project", local)
+    kept = next(v for v in vs if v.kind == "before_send")
+    assert kept.on_drive and kept.computer == "Studio-Mac" and "MAC-EDIT" in read_set_xml(kept.set_path)
+    assert next(v for v in vs if v.kind == "current").computer == "Studio-PC (this computer)"
+    # the Mac sees the PC's version as the current one, saved on Studio-PC
+    pull(mac, drive, "Song Project", resolution=("backup_and_get",))
+    cur = next(v for v in list_versions(mac, drive, "Song Project", song) if v.kind == "current")
+    assert cur.computer == "Studio-PC" and "PC-EDIT" in read_set_xml(cur.set_path)
+
+
+def test_open_older_set_version_copies_it_next_to_current(tmp_path, song):
+    from abletonbridge.versions import list_versions, open_version
+    mac, pc = stores(tmp_path)
+    drive = Drive.initialize(tmp_path / "USB")
+    write(song / "Backup" / "Song [2026-10-16 221503].als", (song / "Song.als").read_bytes())
+    push(mac, drive, song)
+    vs = list_versions(mac, drive, "Song Project", song)
+    live = next(v for v in vs if v.kind == "live_backup")
+    assert live.computer == "Studio-Mac (this computer)"
+    assert any(v.kind == "before_pack" for v in vs)                  # the app's own backup, labelled as such
+    before = (song / "Song.als").read_bytes()
+    opened = open_version(live, song)
+    assert opened.parent == song and opened.name.startswith("Song (Studio-Mac ") and opened.suffix == ".als"
+    assert (song / "Song.als").read_bytes() == before
