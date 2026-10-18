@@ -39,19 +39,25 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install pyinstaller pytest
+      - run: pip install pyinstaller pytest certifi
       - run: python -m pytest -q tests
+
+      - name: Stamp the build number into the app
+        shell: bash
+        run: |
+          printf 'BUILD = %s\nCOMMIT = "%s"\n' "${{ github.run_number }}" "${GITHUB_SHA::7}" > abletonbridge/_build.py
+          cat abletonbridge/_build.py
 
       - name: Build (Windows)
         if: runner.os == 'Windows'
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name AbletonBridge AbletonBridge.py
+          pyinstaller --noconfirm --onefile --windowed --name AbletonBridge --hidden-import certifi AbletonBridge.py
           Compress-Archive -Path dist/AbletonBridge.exe -DestinationPath ${{ matrix.artifact }}.zip
 
       - name: Build (macOS)
         if: runner.os == 'macOS'
         run: |
-          pyinstaller --noconfirm --windowed --name "Ableton Bridge" \
+          pyinstaller --noconfirm --windowed --name "Ableton Bridge" --hidden-import certifi \
             --osx-bundle-identifier com.abletonbridge.app AbletonBridge.py
           /usr/libexec/PlistBuddy -c "Add :NSAppleEventsUsageDescription string 'Ableton Bridge presses Save in Ableton Live before sending a project.'" "dist/Ableton Bridge.app/Contents/Info.plist"
           codesign --force --deep --sign - "dist/Ableton Bridge.app"
@@ -62,8 +68,58 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.zip
 
-      - name: Attach to release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+  # Publish every build of the main line as a GitHub release, so installed apps can update themselves
+  # ("Update now" in the app). Release files download without a GitHub login.
+  release:
+    needs: build
+    if: >-
+      github.event_name != 'pull_request' &&
+      (github.ref_name == github.event.repository.default_branch ||
+       github.ref_name == 'main' ||
+       github.ref_name == 'claude/determined-davinci-f55m71' ||
+       startsWith(github.ref, 'refs/tags/v'))
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
         with:
-          files: ${{ matrix.artifact }}.zip
+          path: dist
+          merge-multiple: true
+
+      - name: Write latest.json (build number + checksums)
+        env:
+          NOTES: ${{ github.event.head_commit.message }}
+        run: |
+          cd dist
+          ls -l
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib
+          assets = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(pathlib.Path(".").glob("*.zip"))}
+          assert len(assets) == 3, assets
+          meta = {"build": int(os.environ["GITHUB_RUN_NUMBER"]), "commit": os.environ["GITHUB_SHA"][:7],
+                  "notes": (os.environ.get("NOTES") or "").splitlines()[0][:200] if os.environ.get("NOTES") else "",
+                  "assets": assets}
+          pathlib.Path("latest.json").write_text(json.dumps(meta, indent=2))
+          print(json.dumps(meta, indent=2))
+          PY
+
+      - name: Publish release
+        run: |
+          TAG="build-${GITHUB_RUN_NUMBER}"
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
+            # a re-run of the same build: replace its files
+            gh release upload "$TAG" dist/*.zip dist/latest.json --repo "$REPO" --clobber
+            exit 0
+          fi
+          gh release create "$TAG" dist/*.zip dist/latest.json --repo "$REPO" \
+            --target "$GITHUB_SHA" --title "Ableton Bridge build ${GITHUB_RUN_NUMBER}" \
+            --notes "Built from ${GITHUB_SHA::7}. Installed apps offer this update automatically (or Settings > Check for updates)." \
+            --latest
+
+      - name: Keep only the 10 newest builds
+        run: |
+          gh release list --repo "$REPO" --limit 100 --json tagName --jq '.[].tagName' \
+            | grep '^build-' | tail -n +11 \
+            | xargs -r -I{} gh release delete {} --repo "$REPO" --yes --cleanup-tag

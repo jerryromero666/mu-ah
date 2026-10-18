@@ -59,6 +59,8 @@ samples, and you find out about missing plugins before you open the set.
    - `AbletonBridge-Windows.zip` → `AbletonBridge.exe`
    - `AbletonBridge-Mac-AppleSilicon.zip` (M1/M2/M3/M4 Macs) or `AbletonBridge-Mac-Intel.zip`
    
+   The easiest place is **Releases**: https://github.com/jerryromero666/mu-ah/releases/latest
+   
    **Tip:** put both apps on the drive itself so they always travel with your projects.
 3. **First launch on the Mac:** the app isn't from the App Store, so right-click it → **Open** →
    **Open**. When you first click Send, macOS asks to let Ableton Bridge control your computer
@@ -146,6 +148,21 @@ report with a plugin-by-computer table.
   play on the other computer even without the plugin, and Ableton Bridge recognises them.
 - Plugins inside shells (e.g. Waves) are checked through Live's own plugin database when it's
   readable. Otherwise they show as "Unknown" rather than "Missing".
+
+## Updating the app
+
+Once you've installed a version that has this feature, you never download it by hand again:
+
+- Every time a change is pushed to GitHub and all three apps build successfully, they're published as a
+  GitHub release (`build-<number>`, newest 10 kept).
+- When Ableton Bridge starts, it checks that release. If there's a newer build, a green bar says
+  **New version available** and offers **Update now**. That downloads the right file for this computer
+  (Windows / Apple Silicon Mac / Intel Mac), checks its SHA-256, swaps the app in place and restarts.
+  Settings, sync state and projects stay as they are.
+- **Settings → Check for updates** checks on demand. Turn off *Check for a new version when it starts*
+  if you'd rather not have it check.
+- Update each computer separately, and the copy on the drive too if you start the app from there.
+- Releases are at https://github.com/jerryromero666/mu-ah/releases if you ever want to download by hand.
 
 ## Command line (optional)
 

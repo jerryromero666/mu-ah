@@ -87,6 +87,7 @@ def main(argv=None) -> int:
     p.add_argument("path")
     sub.add_parser("scan-plugins", help="rescan this computer's plugins")
     sub.add_parser("clean-drive", help="remove ._ / .DS_Store junk files from the drive")
+    sub.add_parser("update", help="update this app to the newest build from GitHub")
     args = ap.parse_args(argv)
 
     if args.cmd in (None, "gui"):
@@ -152,9 +153,27 @@ def main(argv=None) -> int:
             print(f"Drive ready: {drive.root}\n{level.upper()}: {advice}")
         elif args.cmd == "scan-plugins":
             bridge.publish_machine(rescan=True, log=print)
+        elif args.cmd == "update":
+            from . import updater
+            info = updater.check()
+            if not info:
+                print(f"You have the latest version (build {updater.current_build()}).")
+            elif not updater.can_self_update():
+                print(f"Build {info.build} is available: {info.page}  (running from source - use git pull)")
+            else:
+                print(f"Downloading build {info.build}...")
+                cmd = updater.install(updater.download(info, progress=_progress_bar))
+                print("Updated. Starting the new version...")
+                updater.restart(cmd)
         elif args.cmd == "clean-drive":
             print(f"Removed {bridge.require_drive().clean_junk()} junk file(s).")
     except BridgeError as e:
         print(f"Error: {e}", file=sys.stderr)
         return 1
+    except Exception as e:  # noqa: BLE001
+        from .updater import UpdateError
+        if isinstance(e, UpdateError):
+            print(f"Error: {e}", file=sys.stderr)
+            return 1
+        raise
     return 0

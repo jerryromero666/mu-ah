@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -12,6 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 
 from . import APP_NAME, __version__
 from . import platform_utils as pu
+from . import updater
 from .core import Bridge
 from .sync import STATUS_TEXT, BridgeError, Conflict
 
@@ -144,6 +146,15 @@ class App(tk.Tk):
         head = tk.Frame(self, bg=BG, padx=24, pady=16)
         head.pack(fill="x")
         self.header = head
+        self.update_bar = tk.Frame(self, bg=GREEN, padx=14, pady=8)
+        # buttons first, so a long message can never squeeze them
+        ttk.Button(self.update_bar, text="Later", command=lambda: self.update_bar.pack_forget()).pack(side="right")
+        ttk.Button(self.update_bar, text="Update now", style="Accent.TButton",
+                   command=lambda: self.start_update(self._update_info)).pack(side="right", padx=(8, 8))
+        self.update_lbl = tk.Label(self.update_bar, bg=GREEN, fg="#0b2a1c", font=(FAMILY, 11, "bold"), anchor="w",
+                                   justify="left", wraplength=640)
+        self.update_lbl.pack(side="left", fill="x", expand=True)
+        self._update_info = None
         self.banner = tk.Label(self, bg=RED, fg="#ffffff", font=(FAMILY, 11), anchor="w", justify="left",
                                padx=14, pady=8, wraplength=900)
         left = tk.Frame(head, bg=BG)
@@ -294,7 +305,7 @@ class App(tk.Tk):
                 conflict = c
                 self.q.put(("call", lambda: self._finish(None, conflict=conflict, retry=retry)))
                 return
-            except BridgeError as e:
+            except (BridgeError, updater.UpdateError) as e:
                 msg = str(e)
                 self.q.put(("call", lambda: self._finish(None, error=msg)))
                 return
@@ -357,7 +368,63 @@ class App(tk.Tk):
             self._fill(rows)
             self.status_lbl.configure(text="Ready." if self.bridge.drive else
                                       "Plug in your transfer drive (or click 'Set up drive...').", fg=TEXT)
+            if updater.can_self_update() and self.bridge.store.settings.check_updates:
+                self.check_for_updates(quiet=True)
+        updater.cleanup_old_versions()
         self.run_task("Starting up...", work, done)
+
+    # ------------------------------------------------------------------ updates
+    def check_for_updates(self, quiet: bool = False):
+        """Ask GitHub for a newer version (in the background). quiet: only speak up if there is one."""
+        def work():
+            try:
+                info = updater.check()
+            except updater.UpdateError as e:
+                msg = str(e)
+                if not quiet:
+                    self.q.put(("call", lambda: messagebox.showwarning(APP_NAME, msg, parent=self)))
+                return
+            self.q.put(("call", lambda: self._show_update(info, quiet)))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_update(self, info, quiet):
+        self._update_info = info
+        if info is None:
+            if not quiet:
+                messagebox.showinfo(APP_NAME, f"You have the latest version (build {updater.current_build()}).",
+                                    parent=self)
+            return
+        self.update_lbl.configure(text=f"New version available: build {info.build} (you have "
+                                       f"{updater.current_build()}). Updates in place and restarts.")
+        self.update_bar.pack(fill="x", padx=24, pady=(0, 12), after=self.header)
+        self.log_msg(f"Update available: build {info.build}" + (f" - {info.notes}" if info.notes else ""))
+
+    def start_update(self, info):
+        if info is None:
+            return
+        if not updater.can_self_update():
+            messagebox.showinfo(APP_NAME, "This copy runs from the source code - update it with 'git pull'.",
+                                parent=self)
+            return
+        if self.busy:
+            messagebox.showinfo(APP_NAME, "Wait until the current send/get has finished, then update.", parent=self)
+            return
+
+        def work(progress, log):
+            log(f"Downloading build {info.build}...")
+            path = updater.download(info, progress=progress)
+            log("Download checked. Installing...")
+            return updater.install(path)
+
+        def done(command):
+            self.log_msg(f"Updated to build {info.build} - restarting.")
+            self.update()
+            updater.restart(command)
+            self.destroy()
+            os._exit(0)
+
+        self.update_bar.pack_forget()
+        self.run_task(f"Updating to build {info.build}...", work, done)
 
     def _watch_drive(self):
         def check():
@@ -384,7 +451,9 @@ class App(tk.Tk):
 
     def _refresh_header(self):
         s = self.bridge.store.settings
-        self.machine_lbl.configure(text=f"This computer: {s.machine_name} · {pu.os_label()}   v{__version__}")
+        build = updater.current_build()
+        ver = f"v{__version__} · build {build}" if build else f"v{__version__} (from source)"
+        self.machine_lbl.configure(text=f"This computer: {s.machine_name} · {pu.os_label()}   {ver}")
         d = self.bridge.drive
         if d:
             fs = d.filesystem()
@@ -1046,15 +1115,18 @@ class SettingsDialog(_Dialog):
         self.v_save = tk.BooleanVar(value=s.auto_save_in_live)
         self.v_open = tk.BooleanVar(value=s.open_after_get)
         self.v_core = tk.BooleanVar(value=s.collect_core_library)
+        self.v_updates = tk.BooleanVar(value=s.check_updates)
         for var, text in ((self.v_save, "Press Save in Ableton Live automatically before sending"),
                           (self.v_open, "Open the project in Live right after getting it from the drive"),
                           (self.v_core, "Also pack Live's Core Library / Pack sounds into the project "
-                                        "(safest, uses a little more space)")):
+                                        "(safest, uses a little more space)"),
+                          (self.v_updates, "Check for a new version of Ableton Bridge when it starts")):
             ttk.Checkbutton(self, text=text, variable=var).pack(anchor="w", pady=(8, 0))
 
         tools = tk.Frame(self, bg=PANEL)
         tools.pack(fill="x", pady=(16, 0))
         ttk.Button(tools, text="Rescan plugins", command=self._rescan).pack(side="left")
+        ttk.Button(tools, text="Check for updates", command=self._check_updates).pack(side="left", padx=(8, 0))
         ttk.Button(tools, text="Set up a drive...", command=self._setup_drive).pack(side="left", padx=(8, 0))
         ttk.Button(tools, text="Clean Mac/Windows junk files on drive", command=self._clean).pack(side="left",
                                                                                                  padx=(8, 0))
@@ -1069,6 +1141,15 @@ class SettingsDialog(_Dialog):
         d = filedialog.askdirectory(parent=self, initialdir=self.ws_var.get())
         if d:
             self.ws_var.set(d)
+
+    def _check_updates(self):
+        app = self.app
+        self.destroy()
+        if not updater.can_self_update():
+            messagebox.showinfo(APP_NAME, "This copy runs from the source code - update it with 'git pull'.",
+                                parent=app)
+            return
+        app.check_for_updates(quiet=False)
 
     def _rescan(self):
         app = self.app
@@ -1099,6 +1180,7 @@ class SettingsDialog(_Dialog):
         s.auto_save_in_live = self.v_save.get()
         s.open_after_get = self.v_open.get()
         s.collect_core_library = self.v_core.get()
+        s.check_updates = self.v_updates.get()
         self.app.bridge.store.save_settings()
         self.destroy()
         self.app._refresh_header()

@@ -23,6 +23,7 @@ class Settings:
     auto_save_in_live: bool = True
     open_after_get: bool = True
     collect_core_library: bool = True
+    check_updates: bool = True  # look for a newer version on GitHub when the app starts
 
 
 def _atomic_write_json(path: Path, data) -> None:
