@@ -125,6 +125,9 @@ Keep each song in its own folder. Loose `.als` files at the very top of the driv
 
 - On the computer you worked on: save in Live (or let the app do it) and click **↑ Send to Drive**.
 - Plug the drive into the other computer: click **↓ Get from Drive & Open**.
+- **Want a specific project?** Click it in the list first (it turns blue). The big buttons then act on
+  that project, and the text under them names it. Press **Esc** or click empty space in the list to go
+  back to "the latest one".
 
 The project list shows each project's status: *In sync*, *Changes to send*,
 *Newer version on drive*, *Changed on both computers*, *Only on this computer* or

@@ -27,6 +27,7 @@ ACCENT_HI = "#ff9466"
 BLUE = "#4c9dff"
 BLUE_HI = "#6cb0ff"
 GREEN = "#3ecf8e"
+SELECT_BG = "#2d5fa8"  # selected row: unmistakable
 YELLOW = "#f2c14e"
 RED = "#ff5f5f"
 
@@ -122,7 +123,7 @@ class App(tk.Tk):
         st.configure(".", background=BG, foreground=TEXT, font=(FAMILY, 11))
         st.configure("Treeview", background=PANEL, fieldbackground=PANEL, foreground=TEXT, rowheight=32,
                      borderwidth=0, font=(FAMILY, 12))
-        st.map("Treeview", background=[("selected", PANEL_HI)], foreground=[("selected", "#ffffff")])
+        st.map("Treeview", background=[("selected", SELECT_BG)], foreground=[("selected", "#ffffff")])
         st.configure("Treeview.Heading", background=BG, foreground=MUTED, borderwidth=0, relief="flat",
                      font=(FAMILY, 10, "bold"), padding=(6, 6))
         st.map("Treeview.Heading", background=[("active", BG)])
@@ -169,11 +170,11 @@ class App(tk.Tk):
         hero.columnconfigure(1, weight=1, uniform="h")
         self.send_btn = BigButton(hero, "↑  Send to Drive",
                                   "Saves in Live, packs every sample into the project, copies it to the drive.",
-                                  ACCENT, ACCENT_HI, self.action_send_current)
+                                  ACCENT, ACCENT_HI, self.action_send_main)
         self.send_btn.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
         self.get_btn = BigButton(hero, "↓  Get from Drive & Open",
                                  "Copies the latest project from the drive to this computer and opens it in Live.",
-                                 BLUE, BLUE_HI, self.action_get_latest)
+                                 BLUE, BLUE_HI, self.action_get_main)
         self.get_btn.grid(row=0, column=1, sticky="nsew", padx=(8, 0))
 
         # project table
@@ -204,7 +205,10 @@ class App(tk.Tk):
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
         sb.pack(side="right", fill="y")
-        self.tree.bind("<<TreeviewSelect>>", lambda e: self._update_actions())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: (self._update_actions(), self._update_hero()))
+        # Click on empty space or press Esc: nothing selected, so the big buttons go back to "latest".
+        self.tree.bind("<Button-1>", self._click_empty, add="+")
+        self.bind("<Escape>", lambda e: self.tree.selection_set(()))
         self.tree.bind("<Double-1>", lambda e: self.action_primary())
 
         actions = tk.Frame(body, bg=BG)
@@ -332,10 +336,13 @@ class App(tk.Tk):
             done(result)
 
     def _set_busy(self, on: bool):
-        self.send_btn.set_enabled(not on)
-        self.get_btn.set_enabled(not on and self.bridge.drive is not None)
         self.configure(cursor="watch" if on else "")
         self._update_actions()
+        self._update_hero()
+
+    def _click_empty(self, event):
+        if not self.tree.identify_row(event.y):
+            self.tree.selection_set(())
 
     # ------------------------------------------------------------------ startup / drive
     def _startup(self):
@@ -396,14 +403,42 @@ class App(tk.Tk):
             self.drive_lbl.configure(text="No drive plugged in")
             self.drive_btn.pack(side="right", padx=(10, 0))
             self.banner.pack_forget()
-        self.get_btn.set_enabled(d is not None and not self.busy)
-        self._update_get_subtitle()
+        self._update_hero()
 
-    def _update_get_subtitle(self):
+    def _update_hero(self):
+        """The big buttons act on the selected project; with nothing selected, on the latest one."""
+        r = self.selected()
         d = self.bridge.drive
+        busy = self.busy
+        # Send
+        if r is None:
+            self.send_btn.set_subtitle("Saves in Live, packs every sample into the project, copies it to the drive.")
+            self.send_btn.set_enabled(not busy)
+        elif r.local_dir:
+            self.send_btn.set_subtitle(f"Selected: \"{r.label or r.name}\" - packs its samples and copies it "
+                                       "to the drive.")
+            self.send_btn.set_enabled(not busy)
+        else:
+            self.send_btn.set_subtitle(f"\"{r.label or r.name}\" is only on the drive - get it first.")
+            self.send_btn.set_enabled(False)
+        # Get
         if not d:
             self.get_btn.set_subtitle("Plug in the transfer drive first.")
+            self.get_btn.set_enabled(False)
             return
+        if r is not None:
+            if r.manifest:
+                by = r.manifest.get("pushed_by", {})
+                who = by.get("name", "?")
+                src = f"({who})" if by.get("id") == "drive" else f"from {who}"
+                self.get_btn.set_subtitle(f"Selected: \"{r.label or r.name}\" {src}, {ago(r.sent_at)}.")
+                self.get_btn.set_enabled(not busy)
+            else:
+                self.get_btn.set_subtitle(f"\"{r.label or r.name}\" isn't on the drive yet. Press Esc to get "
+                                          "the latest instead.")
+                self.get_btn.set_enabled(False)
+            return
+        self.get_btn.set_enabled(not busy)
         mans = d.manifests()
         if not mans:
             self.get_btn.set_subtitle("Nothing on the drive yet - send a project from the other computer.")
@@ -417,9 +452,11 @@ class App(tk.Tk):
             by = m.get("pushed_by", {})
             when = ago(m.get("pushed_at", 0))
             if by.get("id") == "drive":
-                self.get_btn.set_subtitle(f"Latest: \"{name}\" ({by.get('name')}, saved {when}).")
+                self.get_btn.set_subtitle(f"Latest: \"{name}\" ({by.get('name')}, saved {when}). "
+                                          "Or select a project below.")
             else:
-                self.get_btn.set_subtitle(f"Latest: \"{name}\" from {by.get('name', '?')}, {when}.")
+                self.get_btn.set_subtitle(f"Latest: \"{name}\" from {by.get('name', '?')}, {when}. "
+                                          "Or select a project below.")
 
     def setup_drive(self):
         messagebox.showinfo(APP_NAME, "Choose your external drive (the top level of the drive).\n\n"
@@ -457,7 +494,6 @@ class App(tk.Tk):
 
     def _fill(self, rows):
         sel = self.selected()
-        sel_name = sel.name if sel else None
         self.rows = rows
         self.tree.delete(*self.tree.get_children())
         for i, r in enumerate(rows):
@@ -471,12 +507,18 @@ class App(tk.Tk):
             self.tree.insert("", "end", iid=str(i), text="   " + (r.label or r.name),
                              values=(f"{STATUS_ICONS[r.status]}  {STATUS_TEXT[r.status]}",
                                      ago(r.sent_at), by, local), tags=(r.status,))
-            if r.name == sel_name:
-                self.tree.selection_set(str(i))
         if not rows:
             self.tree.insert("", "end", iid="empty", text="   No Ableton projects found yet",
                              values=("Add your project folders in Settings", "", "", ""), tags=("local_only",))
-        self._update_get_subtitle()
+        # Keep the same project selected (its row changes after a Get, e.g. it's now on this computer).
+        if sel is not None:
+            same = [i for i, r in enumerate(rows) if r.name == sel.name]
+            exact = [i for i in same if rows[i].local_dir == sel.local_dir]
+            pick = (exact or [i for i in same if rows[i].local_dir is None or sel.local_dir is None] or same)
+            if pick:
+                self.tree.selection_set(str(pick[0]))
+                self.tree.see(str(pick[0]))
+        self._update_hero()
         self._update_actions()
 
     def selected(self):
@@ -510,6 +552,21 @@ class App(tk.Tk):
         elif r.local_dir:
             self.action_open_selected()
 
+    def action_send_main(self):
+        r = self.selected()
+        if r is not None and r.local_dir:
+            self.action_send_selected(save_first=True)
+        elif r is None:
+            self.action_send_current()
+
+    def action_get_main(self):
+        r = self.selected()
+        if r is not None:
+            if r.manifest:
+                self._get(r.name)
+        else:
+            self.action_get_latest()
+
     def action_send_current(self):
         if not self.bridge.drive:
             self.bridge.refresh_drive()
@@ -527,10 +584,20 @@ class App(tk.Tk):
 
         self.run_task("Saving in Live...", work, done=lambda proj: self._send(proj))
 
-    def action_send_selected(self):
+    def action_send_selected(self, save_first: bool = False):
         r = self.selected()
-        if r and r.local_dir:
+        if not (r and r.local_dir):
+            return
+        if not save_first:
             self._send(r.local_dir)
+            return
+        target = r.local_dir
+
+        def work(progress, log):
+            self.bridge.save_in_live_then_find(log=log)  # presses Save in Live if it's open (setting)
+            return target
+
+        self.run_task("Saving in Live...", work, done=lambda proj: self._send(proj))
 
     def _send(self, project_dir: Path, resolution: tuple = ()):
         def work(progress, log):
